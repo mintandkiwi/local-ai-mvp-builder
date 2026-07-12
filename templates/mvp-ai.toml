@@ -1,0 +1,6 @@
+[project]
+name = "replace-me"
+
+[validation]
+# Commands run after each coding/fix stage. Replace these with the project's real checks.
+commands = []

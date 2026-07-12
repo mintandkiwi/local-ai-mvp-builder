@@ -1,0 +1,17 @@
+[models.primary]
+id = "qwen3-coder:30b"
+role = "coding"
+context_tokens = 32768
+description = "主力 agentic coding 模型；低内存压力，优先执行项目计划与修复任务。"
+
+[models.secondary]
+id = "qwen3.6:35b"
+role = "complex-coding"
+context_tokens = 32768
+description = "复杂中文需求、长计划和主力模型失败时的本地备选。"
+
+[models.optional_reviewer]
+id = "gemma4:26b"
+role = "diverse-review"
+context_tokens = 32768
+description = "可选的异构本地复核模型；MVP 阶段不默认下载或调用。"

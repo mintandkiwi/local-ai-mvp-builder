@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+proxy=${MVP_OLLAMA_PROXY:-http://127.0.0.1:7890}
+if nc -z 127.0.0.1 7890 >/dev/null 2>&1; then
+  export HTTP_PROXY=${HTTP_PROXY:-$proxy}
+  export HTTPS_PROXY=${HTTPS_PROXY:-$proxy}
+  export ALL_PROXY=${ALL_PROXY:-socks5://127.0.0.1:7890}
+fi
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+python3 "$SCRIPT_DIR/../src/fast_pull.py" qwen3-coder:30b
+
+if [ "${1:-}" = "--with-secondary" ]; then
+  python3 "$SCRIPT_DIR/../src/fast_pull.py" qwen3.6:35b
+fi
