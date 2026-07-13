@@ -52,4 +52,4 @@
 
 跨 Agent Skill 唯一源、安全监督启动器、四平台幂等安装器、真实回归测试、公开 README 和 MIT License 均已实现。自动运行最终状态 `needs_manual_attention` 作为历史证据保留；其遗留 finding 已由人工接管修复，原生环境 44 项测试全部通过，受监督验证沙箱 44 项通过、2 项因父级 Seatbelt 限制精确跳过，Python 编译、Shell 语法、中文文档门禁和新的独立 Review 均已通过。
 
-方案 B 已实际安装：Codex、Claude Code、Antigravity IDE 和 Antigravity CLI 的用户级 Skill 目录均软链接到仓库唯一源，`~/.local/bin/mvp-loop-supervised` 可正常显示帮助；旧 Codex Skill 已保留时间戳备份。公开 GitHub 仓库 `https://github.com/mintandkiwi/local-ai-mvp-builder` 已创建并配置为 `origin`，正在完成获授权的提交、分支推送和 Draft PR。
+方案 B 已实际安装：Codex、Claude Code、Antigravity IDE 和 Antigravity CLI 的用户级 Skill 目录均软链接到仓库唯一源，`~/.local/bin/mvp-loop-supervised` 可正常显示帮助；旧 Codex Skill 已保留时间戳备份。公开 GitHub 仓库 `https://github.com/mintandkiwi/local-ai-mvp-builder` 已创建，`main` 基线与 `agent/cross-agent-skill` 功能分支均已推送，Draft PR #1 位于 `https://github.com/mintandkiwi/local-ai-mvp-builder/pull/1`，等待用户最终评审。
