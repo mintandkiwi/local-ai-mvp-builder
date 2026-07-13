@@ -3,9 +3,11 @@ import hashlib
 import importlib.util
 import io
 import json
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -82,9 +84,102 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(MODULE.model_id("primary"), "qwen3-coder:30b")
 
     def test_prompt_replacement(self):
-        prompt = MODULE.render_prompt("coder.md", plan="PLAN-SENTINEL")
+        prompt = MODULE.render_prompt(
+            "coder.md", plan="PLAN-SENTINEL", today="2026-07-13"
+        )
         self.assertIn("PLAN-SENTINEL", prompt)
+        self.assertIn("2026-07-13", prompt)
         self.assertNotIn("{{PLAN}}", prompt)
+        self.assertNotIn("{{TODAY}}", prompt)
+
+    def test_live_redaction_masks_common_credentials(self):
+        text = MODULE.redact_live_text(
+            "OPENAI_API_KEY=top-secret AWS_SECRET_ACCESS_KEY=aws-secret "
+            "password: hunter2 "
+            "token=ghp_abcdefghijklmnopqrstuvwxyz123456"
+        )
+        self.assertNotIn("top-secret", text)
+        self.assertNotIn("aws-secret", text)
+        self.assertNotIn("hunter2", text)
+        self.assertNotIn("ghp_", text)
+        self.assertIn("[REDACTED]", text)
+
+    def test_live_command_event_does_not_print_command_output(self):
+        event = {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "python -m unittest",
+                "aggregated_output": "API_KEY=must-not-appear",
+                "status": "completed",
+                "exit_code": 0,
+            },
+        }
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            MODULE.display_codex_event(json.dumps(event), "LOCAL")
+        rendered = output.getvalue()
+        self.assertIn("exit=0", rendered)
+        self.assertNotIn("must-not-appear", rendered)
+
+    def test_watchdog_ignores_unstructured_telemetry_noise(self):
+        self.assertFalse(
+            MODULE.is_progress_event("2026-07-13 WARN reconnecting", True)
+        )
+        self.assertTrue(
+            MODULE.is_progress_event('{"type":"item.started"}', True)
+        )
+
+    def test_streaming_json_events_are_displayed_and_logged(self):
+        event = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "safe progress"},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "stream.log"
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = MODULE.run_command(
+                    [sys.executable, "-c", f"print({event!r})"],
+                    cwd=Path(directory),
+                    timeout=5,
+                    stdin_text=None,
+                    log_path=log_path,
+                    live=True,
+                    live_channel="LOCAL",
+                    json_events=True,
+                )
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("模型说明：safe progress", output.getvalue())
+            self.assertIn("safe progress", log_path.read_text(encoding="utf-8"))
+
+    def test_monitor_kills_stalled_local_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "stalled.log"
+            started = time.monotonic()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                MODULE.run_command(
+                    [sys.executable, "-c", "import time; time.sleep(2)"],
+                    cwd=Path(directory),
+                    timeout=5,
+                    stdin_text=None,
+                    log_path=log_path,
+                    monitor=True,
+                    idle_timeout=0.1,
+                )
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertIn("error: timeout", log_path.read_text(encoding="utf-8"))
+
+    def test_run_directory_is_private(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "runs").mkdir()
+            with mock.patch.object(MODULE, "ROOT", root):
+                run_dir = MODULE.make_run_dir(root / "project")
+            mode = stat.S_IMODE(run_dir.stat().st_mode)
+            self.assertEqual(mode, 0o700)
 
     def test_reviewer_prompt_declares_uncommitted_scope(self):
         prompt = MODULE.render_prompt(
@@ -113,6 +208,20 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(normalized["verdict"], "fail")
         self.assertEqual(normalized["findings"][0]["severity"], "P1")
 
+    def test_documentation_failure_has_specific_finding(self):
+        review = {"verdict": "pass", "findings": []}
+        normalized = MODULE.normalize_review(
+            review,
+            [
+                {"command": "test", "exit_code": 0},
+                {"command": "documentation-contract", "exit_code": 1},
+            ],
+        )
+        finding = normalized["findings"][0]
+        self.assertEqual(normalized["verdict"], "fail")
+        self.assertEqual(finding["file"], "docs/")
+        self.assertIn("中文开发文档", finding["title"])
+
     def test_validation_config(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
@@ -123,6 +232,85 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(
                 MODULE.load_validation_commands(project), ["python -m unittest"]
             )
+
+    def test_development_document_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            run_dir = root / "run"
+            project.mkdir()
+            run_dir.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+            today = "2026-07-13"
+            content_by_path = {
+                Path(f"docs/devlog/{today}.md"): (
+                    "# 开发日志\n## 今日目标\n完成目标。\n## 今日进展\n完成进展。\n"
+                    "## 修改内容\n修改模块。\n## 使用方法\n运行命令。\n## 验证结果\n"
+                    "测试通过。\n## 后续事项\n继续优化和验证。\n"
+                ),
+                Path("docs/ai/PROJECT_OUTLINE.md"): (
+                    "# 项目开发大纲\n## 项目目标\n实现项目目标。\n## 技术栈\n使用技术栈。\n"
+                    "## 架构与关键路径\n描述架构路径。\n## 重要文件\n列出重要文件。\n"
+                    "## 约束\n遵守项目约束。\n## 当前状态\n当前功能已经完成。\n"
+                ),
+                Path("docs/ai/TASK_PLAN.md"): (
+                    "# AI 任务规划\n## 当前里程碑\n完成当前里程碑。\n## 已完成\n"
+                    "任务已经完成。\n## 进行中\n暂无进行任务。\n## 待办\n继续后续任务。\n"
+                    "## 验收标准\n测试全部通过。\n## 下一步\n开始下一项任务。\n"
+                ),
+            }
+            for relative, content in content_by_path.items():
+                path = project / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            outcome = MODULE.validate_development_documents(
+                project, run_dir, "stage", today
+            )
+            self.assertEqual(outcome["exit_code"], 0)
+
+            (project / "docs/ai/TASK_PLAN.md").unlink()
+            outcome = MODULE.validate_development_documents(
+                project, run_dir, "missing", today
+            )
+            self.assertEqual(outcome["exit_code"], 1)
+            self.assertIn(
+                "缺少 docs/ai/TASK_PLAN.md",
+                Path(outcome["log"]).read_text(encoding="utf-8"),
+            )
+
+            task_target = root / "external-task-plan.md"
+            task_target.write_text(content_by_path[Path("docs/ai/TASK_PLAN.md")])
+            (project / "docs/ai/TASK_PLAN.md").symlink_to(task_target)
+            outcome = MODULE.validate_development_documents(
+                project, run_dir, "symlink", today
+            )
+            self.assertEqual(outcome["exit_code"], 1)
+            self.assertIn(
+                "不能是符号链接",
+                Path(outcome["log"]).read_text(encoding="utf-8"),
+            )
+
+    def test_version_snapshot_omits_remote_url_and_never_claims_push(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://embedded-token@example.invalid/private.git",
+                ],
+                cwd=project,
+                check=True,
+            )
+            snapshot = MODULE.version_control_snapshot(project)
+        serialized = json.dumps(snapshot)
+        self.assertEqual(snapshot["remotes"], ["origin"])
+        self.assertNotIn("embedded-token", serialized)
+        self.assertFalse(snapshot["commit_created"])
+        self.assertFalse(snapshot["pushed"])
 
     @mock.patch.object(MODULE, "run_command")
     def test_local_coder_places_global_approval_before_exec(self, run_command):
@@ -141,6 +329,27 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(command[:4], ["codex", "-a", "never", "exec"])
         self.assertNotIn("-a", command[4:])
         self.assertIn("--ignore-user-config", command)
+        self.assertIn("--json", command)
+        self.assertTrue(run_command.call_args.kwargs["monitor"])
+
+    @mock.patch.object(MODULE, "run_command")
+    def test_local_coder_enables_structured_events_in_live_mode(self, run_command):
+        settings = SimpleNamespace(
+            codex_command="codex", coder_timeout_seconds=30
+        )
+        MODULE.call_local_coder(
+            settings,
+            Path("/tmp/project"),
+            "model",
+            "prompt",
+            Path("/tmp"),
+            "stage",
+            live=True,
+        )
+        command = run_command.call_args.args[0]
+        self.assertIn("--json", command)
+        self.assertTrue(run_command.call_args.kwargs["live"])
+        self.assertTrue(run_command.call_args.kwargs["json_events"])
 
     @mock.patch.object(MODULE.subprocess, "run")
     def test_codex_process_bypasses_proxy_for_loopback(self, subprocess_run):
@@ -316,8 +525,19 @@ class OrchestratorTests(unittest.TestCase):
                 allow_dirty=False,
             )
             with mock.patch.object(MODULE, "make_run_dir", return_value=project):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    result = MODULE.command_run(args)
+                valid_docs = {
+                    "command": "documentation-contract",
+                    "exit_code": 0,
+                    "elapsed_seconds": 0.0,
+                    "log": str(project / "docs.log"),
+                }
+                with mock.patch.object(
+                    MODULE,
+                    "validate_development_documents",
+                    return_value=valid_docs,
+                ):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        result = MODULE.command_run(args)
 
         self.assertEqual(result, 0)
         self.assertEqual(call_local_coder.call_count, 2)
@@ -327,6 +547,64 @@ class OrchestratorTests(unittest.TestCase):
             [call.args[-1] for call in call_reviewer.call_args_list], [1, 2, 3]
         )
         write_summary.assert_called_once()
+        self.assertEqual(
+            write_summary.call_args.kwargs["status"], "ready_for_user_review"
+        )
+
+    @mock.patch.object(MODULE, "write_summary")
+    @mock.patch.object(MODULE, "call_supervisor")
+    @mock.patch.object(MODULE, "call_reviewer")
+    @mock.patch.object(MODULE, "validate_development_documents")
+    @mock.patch.object(MODULE, "run_validations")
+    @mock.patch.object(MODULE, "call_local_coder")
+    @mock.patch.object(MODULE, "ensure_model_available")
+    @mock.patch.object(MODULE, "validate_project")
+    def test_watchdog_hands_local_failure_to_supervisor(
+        self,
+        validate_project,
+        ensure_model_available,
+        call_local_coder,
+        run_validations,
+        validate_development_documents,
+        call_reviewer,
+        call_supervisor,
+        write_summary,
+    ):
+        call_local_coder.side_effect = MODULE.WorkflowError("ollama stopped")
+        run_validations.return_value = [{"command": "test", "exit_code": 0}]
+        validate_development_documents.return_value = {
+            "command": "documentation-contract",
+            "exit_code": 0,
+        }
+        call_reviewer.return_value = {
+            "verdict": "pass",
+            "summary": "fixed",
+            "findings": [],
+            "tests": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            plan = project / "plan.md"
+            plan.write_text("# plan", encoding="utf-8")
+            (project / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["test"]\n', encoding="utf-8"
+            )
+            args = SimpleNamespace(
+                project=str(project),
+                plan=str(plan),
+                model="primary",
+                allow_dirty=False,
+                live=False,
+            )
+            with mock.patch.object(MODULE, "make_run_dir", return_value=project):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    result = MODULE.command_run(args)
+            event = json.loads((project / "watchdog.json").read_text())
+
+        self.assertEqual(result, 0)
+        self.assertEqual(event["action"], "codex_supervisor_takeover")
+        call_supervisor.assert_called_once()
+        self.assertEqual(call_reviewer.call_count, 1)
         self.assertEqual(
             write_summary.call_args.kwargs["status"], "ready_for_user_review"
         )

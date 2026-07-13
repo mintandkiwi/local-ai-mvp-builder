@@ -7,6 +7,7 @@
 - Do not commit, push, change branches, or rewrite Git history.
 - Add regression tests for bug fixes and run the configured validation commands.
 - Never expose secrets from environment files or credential stores.
+- After every development run, update the Chinese daily log at `docs/devlog/YYYY-MM-DD.md` and the AI-readable files `docs/ai/PROJECT_OUTLINE.md` and `docs/ai/TASK_PLAN.md`.
 
 ## Code Review
 

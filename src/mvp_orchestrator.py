@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,17 @@ MODELS_PATH = ROOT / "config" / "models.toml"
 REVIEW_SCHEMA = ROOT / "schemas" / "review.schema.json"
 PROMPTS = ROOT / "prompts"
 
+SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b([a-z0-9_-]*(?:api[_-]?key|access[_-]?token|auth[_-]?token|"
+    r"token|password|passwd|secret)[a-z0-9_-]*)"
+    r"(\s*[:=]\s*)([^\s,;]+)"
+)
+KNOWN_TOKEN = re.compile(
+    r"\b(sk-[A-Za-z0-9_-]{10,}|gh[pousr]_[A-Za-z0-9_]{10,}|"
+    r"AKIA[0-9A-Z]{12,}|Bearer\s+[A-Za-z0-9._~+/=-]{10,})\b",
+    re.IGNORECASE,
+)
+
 
 class WorkflowError(RuntimeError):
     pass
@@ -36,6 +48,7 @@ class WorkflowError(RuntimeError):
 class Settings:
     max_local_review_rounds: int
     coder_timeout_seconds: int
+    local_stall_timeout_seconds: int
     review_timeout_seconds: int
     supervisor_timeout_seconds: int
     require_clean_worktree: bool
@@ -59,6 +72,7 @@ def load_settings() -> Settings:
     return Settings(
         max_local_review_rounds=int(workflow["max_local_review_rounds"]),
         coder_timeout_seconds=int(workflow["coder_timeout_seconds"]),
+        local_stall_timeout_seconds=int(workflow["local_stall_timeout_seconds"]),
         review_timeout_seconds=int(workflow["review_timeout_seconds"]),
         supervisor_timeout_seconds=int(workflow["supervisor_timeout_seconds"]),
         require_clean_worktree=bool(workflow["require_clean_worktree"]),
@@ -77,6 +91,207 @@ def render_prompt(name: str, **values: str) -> str:
     return text
 
 
+def redact_live_text(text: str, limit: int = 600) -> str:
+    """Redact common credential forms before displaying child-process events."""
+    clean = SECRET_ASSIGNMENT.sub(r"\1\2[REDACTED]", text)
+    clean = KNOWN_TOKEN.sub("[REDACTED]", clean)
+    clean = clean.replace("-----BEGIN PRIVATE KEY-----", "[REDACTED PRIVATE KEY]")
+    clean = clean.replace("-----BEGIN RSA PRIVATE KEY-----", "[REDACTED PRIVATE KEY]")
+    clean = clean.strip()
+    if len(clean) > limit:
+        return clean[:limit].rstrip() + "…"
+    return clean
+
+
+def emit_progress(channel: str, message: str) -> None:
+    stamp = dt.datetime.now().strftime("%H:%M:%S")
+    print(f"[{stamp}] [{channel}] {redact_live_text(message)}", flush=True)
+
+
+def display_codex_event(line: str, channel: str) -> None:
+    """Render safe summaries from `codex exec --json` JSONL output."""
+    stripped = line.strip()
+    if not stripped:
+        return
+    try:
+        event = json.loads(stripped)
+    except json.JSONDecodeError:
+        if "ERROR:" in stripped or "Error:" in stripped:
+            emit_progress(channel, stripped)
+        return
+
+    event_type = str(event.get("type", ""))
+    if event_type == "thread.started":
+        emit_progress(channel, "本地模型会话已建立")
+        return
+    if event_type == "turn.started":
+        emit_progress(channel, "本地模型开始处理计划")
+        return
+    if event_type == "turn.completed":
+        usage = event.get("usage", {})
+        emit_progress(
+            channel,
+            "本轮完成"
+            f"（输入 {usage.get('input_tokens', '?')} tokens，"
+            f"输出 {usage.get('output_tokens', '?')} tokens）",
+        )
+        return
+
+    if event_type not in {"item.started", "item.updated", "item.completed"}:
+        return
+    item = event.get("item")
+    if not isinstance(item, dict):
+        return
+    item_type = str(item.get("type", ""))
+    completed = event_type == "item.completed"
+
+    if item_type == "agent_message" and completed:
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            emit_progress(channel, "模型说明：" + text)
+    elif item_type == "reasoning" and completed:
+        summary = item.get("summary") or item.get("text")
+        if isinstance(summary, str) and summary.strip():
+            emit_progress(channel, "模型提供的推理摘要：" + summary)
+    elif item_type == "command_execution":
+        command = str(item.get("command", "命令"))
+        if event_type == "item.started":
+            emit_progress(channel, "执行命令：" + command)
+        elif completed:
+            exit_code = item.get("exit_code")
+            status = item.get("status", "completed")
+            emit_progress(channel, f"命令结束：{status}，exit={exit_code}")
+    elif item_type in {"file_change", "file_write", "file_edit"} and completed:
+        paths: list[str] = []
+        changes = item.get("changes")
+        if isinstance(changes, list):
+            for change in changes:
+                if isinstance(change, dict) and change.get("path"):
+                    paths.append(str(change["path"]))
+        path = item.get("path")
+        if path:
+            paths.append(str(path))
+        emit_progress(channel, "文件改动：" + (", ".join(paths) or "已应用"))
+    elif item_type == "error" and completed:
+        message = item.get("message")
+        if isinstance(message, str):
+            emit_progress(channel, "运行提示：" + message)
+
+
+def is_progress_event(line: str, json_events: bool) -> bool:
+    if not json_events:
+        return True
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return False
+    return str(event.get("type", "")) in {
+        "thread.started",
+        "turn.started",
+        "turn.completed",
+        "item.started",
+        "item.updated",
+        "item.completed",
+    }
+
+
+def run_streaming_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    timeout: int,
+    stdin_text: str | None,
+    env: dict[str, str],
+    channel: str,
+    json_events: bool,
+    display: bool,
+    idle_timeout: int | None,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+    if process.stdin is not None:
+        try:
+            process.stdin.write(stdin_text or "")
+            process.stdin.close()
+        except BrokenPipeError:
+            pass
+    assert process.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    output: list[str] = []
+    deadline = time.monotonic() + timeout
+    last_output_at = time.monotonic()
+    try:
+        while True:
+            now = time.monotonic()
+            remaining = deadline - now
+            if remaining <= 0:
+                process.kill()
+                tail = process.stdout.read()
+                if tail:
+                    output.append(tail)
+                process.wait()
+                raise subprocess.TimeoutExpired(
+                    command, timeout, output="".join(output)
+                )
+            idle_remaining = (
+                idle_timeout - (now - last_output_at)
+                if idle_timeout is not None
+                else remaining
+            )
+            if idle_timeout is not None and idle_remaining <= 0:
+                process.kill()
+                tail = process.stdout.read()
+                if tail:
+                    output.append(tail)
+                process.wait()
+                raise subprocess.TimeoutExpired(
+                    command, idle_timeout, output="".join(output)
+                )
+            events = selector.select(
+                timeout=min(0.25, remaining, idle_remaining)
+            )
+            for key, _ in events:
+                line = key.fileobj.readline()
+                if not line:
+                    selector.unregister(key.fileobj)
+                    continue
+                if is_progress_event(line, json_events):
+                    last_output_at = time.monotonic()
+                output.append(line)
+                if display:
+                    if json_events:
+                        display_codex_event(line, channel)
+                    else:
+                        emit_progress(channel, line)
+            if process.poll() is not None:
+                tail = process.stdout.read()
+                if tail:
+                    output.append(tail)
+                    if display:
+                        for line in tail.splitlines():
+                            if json_events:
+                                display_codex_event(line, channel)
+                            else:
+                                emit_progress(channel, line)
+                break
+    finally:
+        selector.close()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        process.stdout.close()
+    return subprocess.CompletedProcess(command, process.returncode, "".join(output))
+
+
 def run_command(
     command: list[str],
     *,
@@ -85,6 +300,11 @@ def run_command(
     stdin_text: str | None,
     log_path: Path,
     check: bool = True,
+    live: bool = False,
+    monitor: bool = False,
+    live_channel: str = "PROCESS",
+    json_events: bool = False,
+    idle_timeout: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     started = time.monotonic()
     env = os.environ.copy()
@@ -94,17 +314,30 @@ def run_command(
     env["no_proxy"] = loopback
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     try:
-        result = subprocess.run(
-            command,
-            cwd=cwd,
-            input=stdin_text,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-            env=env,
-            check=False,
-        )
+        if live or monitor:
+            result = run_streaming_process(
+                command,
+                cwd=cwd,
+                timeout=timeout,
+                stdin_text=stdin_text,
+                env=env,
+                channel=live_channel,
+                json_events=json_events,
+                display=live,
+                idle_timeout=idle_timeout,
+            )
+        else:
+            result = subprocess.run(
+                command,
+                cwd=cwd,
+                input=stdin_text,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                env=env,
+                check=False,
+            )
     except subprocess.TimeoutExpired as exc:
         elapsed = time.monotonic() - started
         output = exc.stdout or ""
@@ -282,13 +515,19 @@ def validation_environment(run_dir: Path) -> dict[str, str]:
 
 
 def run_validations(
-    project: Path, commands: list[str], run_dir: Path, stage: str
+    project: Path,
+    commands: list[str],
+    run_dir: Path,
+    stage: str,
+    live: bool = False,
 ) -> list[dict[str, Any]]:
     outcomes: list[dict[str, Any]] = []
     profile = write_validation_profile(project, run_dir)
     env = validation_environment(run_dir)
     for index, command in enumerate(commands, start=1):
         log_path = run_dir / f"{stage}-validation-{index}.log"
+        if live:
+            emit_progress("VALIDATE", f"开始：{command}")
         started = time.monotonic()
         exit_code = 124
         output = ""
@@ -320,7 +559,115 @@ def run_validations(
                 "log": str(log_path),
             }
         )
+        if live:
+            result_text = "通过" if exit_code == 0 else f"失败（exit={exit_code}）"
+            emit_progress(
+                "VALIDATE",
+                f"{result_text}，耗时 {elapsed:.2f}s；完整输出：{log_path}",
+            )
     return outcomes
+
+
+def development_document_requirements(today: str) -> list[tuple[Path, tuple[str, ...]]]:
+    return [
+        (
+            Path("docs/devlog") / f"{today}.md",
+            (
+                "今日目标",
+                "今日进展",
+                "修改内容",
+                "使用方法",
+                "验证结果",
+                "后续事项",
+            ),
+        ),
+        (
+            Path("docs/ai/PROJECT_OUTLINE.md"),
+            (
+                "项目目标",
+                "技术栈",
+                "架构与关键路径",
+                "重要文件",
+                "约束",
+                "当前状态",
+            ),
+        ),
+        (
+            Path("docs/ai/TASK_PLAN.md"),
+            (
+                "当前里程碑",
+                "已完成",
+                "进行中",
+                "待办",
+                "验收标准",
+                "下一步",
+            ),
+        ),
+    ]
+
+
+def validate_development_documents(
+    project: Path, run_dir: Path, stage: str, today: str
+) -> dict[str, Any]:
+    problems: list[str] = []
+    for relative, headings in development_document_requirements(today):
+        path = project / relative
+        if path.is_symlink():
+            problems.append(f"{relative} 不能是符号链接")
+            continue
+        if not path.is_file():
+            problems.append(f"缺少 {relative}")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if len(re.findall(r"[\u4e00-\u9fff]", text)) < 20:
+            problems.append(f"{relative} 中文内容不足")
+        missing = [heading for heading in headings if heading not in text]
+        if missing:
+            problems.append(f"{relative} 缺少章节：{', '.join(missing)}")
+        changed = git_output(project, "status", "--porcelain", "--", str(relative))
+        if not changed.strip():
+            problems.append(f"{relative} 未在本次开发中更新")
+
+    log_path = run_dir / f"{stage}-documentation.log"
+    if problems:
+        output = "中文开发文档校验失败：\n- " + "\n- ".join(problems) + "\n"
+        exit_code = 1
+    else:
+        output = "中文开发日志、AI 项目大纲和任务规划均已更新。\n"
+        exit_code = 0
+    log_path.write_text(output, encoding="utf-8")
+    return {
+        "command": "documentation-contract",
+        "exit_code": exit_code,
+        "elapsed_seconds": 0.0,
+        "log": str(log_path),
+    }
+
+
+def safe_git_output(project: Path, *args: str) -> str | None:
+    try:
+        value = git_output(project, *args).strip()
+    except WorkflowError:
+        return None
+    return value or None
+
+
+def version_control_snapshot(project: Path) -> dict[str, Any]:
+    branch = safe_git_output(project, "branch", "--show-current")
+    head = safe_git_output(project, "rev-parse", "--short", "HEAD")
+    remote_text = safe_git_output(project, "remote") or ""
+    remotes = [line for line in remote_text.splitlines() if line]
+    return {
+        "branch": branch,
+        "base_commit": head,
+        "remotes": remotes,
+        "remote_configured": bool(remotes),
+        "suggested_commit_message": (
+            f"chore: 整理 {project.name} {dt.date.today().isoformat()} 开发成果"
+        ),
+        "commit_created": False,
+        "pushed": False,
+    }
 
 
 def validations_passed(outcomes: list[dict[str, Any]]) -> bool:
@@ -343,17 +690,33 @@ def normalize_review(
             for item in validations
             if item.get("exit_code") != 0
         ]
+        documentation_failed = "documentation-contract" in failed_commands
         findings.append(
             {
                 "severity": "P1",
-                "title": "项目验证未通过",
-                "file": ".mvp-ai.toml",
+                "title": (
+                    "中文开发文档未更新"
+                    if documentation_failed
+                    else "项目验证未通过"
+                ),
+                "file": "docs/" if documentation_failed else ".mvp-ai.toml",
                 "line": None,
                 "description": (
-                    "没有配置验证命令" if not validations else "验证命令返回非零状态"
+                    "中文开发日志、AI 项目大纲或任务规划未满足文档契约"
+                    if documentation_failed
+                    else (
+                        "没有配置验证命令"
+                        if not validations
+                        else "验证命令返回非零状态"
+                    )
                 ),
-                "required_fix": "修复代码或验证环境并确保这些命令成功："
-                + ", ".join(failed_commands),
+                "required_fix": (
+                    "按要求更新 docs/devlog/YYYY-MM-DD.md、"
+                    "docs/ai/PROJECT_OUTLINE.md 和 docs/ai/TASK_PLAN.md"
+                    if documentation_failed
+                    else "修复代码或验证环境并确保这些命令成功："
+                    + ", ".join(failed_commands)
+                ),
             }
         )
         blocking = True
@@ -391,6 +754,7 @@ def make_run_dir(project: Path) -> Path:
     digest = hashlib.sha256(str(project).encode()).hexdigest()[:8]
     path = ROOT / "runs" / f"{stamp}-{project.name}-{digest}"
     path.mkdir(parents=True, exist_ok=False)
+    path.chmod(0o700)
     return path
 
 
@@ -401,6 +765,7 @@ def call_local_coder(
     prompt: str,
     run_dir: Path,
     stage: str,
+    live: bool = False,
 ) -> None:
     last_message = run_dir / f"{stage}-last-message.txt"
     command = [
@@ -421,6 +786,7 @@ def call_local_coder(
         "workspace-write",
         "--ephemeral",
         "--ignore-user-config",
+        "--json",
         "-o",
         str(last_message),
         "-",
@@ -431,6 +797,11 @@ def call_local_coder(
         timeout=settings.coder_timeout_seconds,
         stdin_text=prompt,
         log_path=run_dir / f"{stage}.log",
+        live=live,
+        monitor=True,
+        live_channel="LOCAL",
+        json_events=True,
+        idle_timeout=getattr(settings, "local_stall_timeout_seconds", 300),
     )
 
 
@@ -534,6 +905,7 @@ def write_summary(
         "review": review,
         "validations": validations,
         "git_status": git_output(project, "status", "--short"),
+        "version_control": version_control_snapshot(project),
     }
     (run_dir / "summary.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -561,6 +933,7 @@ def write_failure_summary(
         "review": review,
         "validations": validations,
         "git_status": status,
+        "version_control": version_control_snapshot(project),
     }
     (run_dir / "summary.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -597,8 +970,37 @@ def command_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def watchdog_review(run_dir: Path, stage: str, error: Exception) -> dict[str, Any]:
+    message = redact_live_text(f"{type(error).__name__}: {error}")
+    event = {
+        "timestamp": dt.datetime.now().astimezone().isoformat(),
+        "stage": stage,
+        "error": message,
+        "action": "codex_supervisor_takeover",
+    }
+    (run_dir / "watchdog.json").write_text(
+        json.dumps(event, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return {
+        "verdict": "fail",
+        "summary": f"本地 AI 在 {stage} 阶段异常，看门狗已触发 Codex 接管。",
+        "findings": [
+            {
+                "severity": "P1",
+                "title": "本地 AI 执行异常",
+                "file": "mvp-loop",
+                "line": None,
+                "description": message,
+                "required_fix": "由 Codex 监督者根据原始计划检查现有改动并完成实现。",
+            }
+        ],
+        "tests": [],
+    }
+
+
 def command_run(args: argparse.Namespace) -> int:
     settings = load_settings()
+    live = bool(getattr(args, "live", False))
     rounds = settings.max_local_review_rounds
     if rounds != 2:
         raise WorkflowError("workflow.max_local_review_rounds 必须固定为 2")
@@ -609,7 +1011,6 @@ def command_run(args: argparse.Namespace) -> int:
     plan = plan_path.read_text(encoding="utf-8")
     model = model_id(args.model)
     validate_project(project, settings.require_clean_worktree and not args.allow_dirty)
-    ensure_model_available(model, settings.ollama_host)
     commands = load_validation_commands(project)
     if not commands:
         raise WorkflowError(
@@ -617,6 +1018,7 @@ def command_run(args: argparse.Namespace) -> int:
         )
     run_dir = make_run_dir(project)
     (run_dir / "plan.md").write_text(plan, encoding="utf-8")
+    today = dt.date.today().isoformat()
     all_validations: list[dict[str, Any]] = []
     latest_validations: list[dict[str, Any]] = []
     latest_review: dict[str, Any] | None = None
@@ -624,7 +1026,7 @@ def command_run(args: argparse.Namespace) -> int:
     def guarded(action):
         try:
             return action()
-        except BaseException as exc:
+        except Exception as exc:
             write_failure_summary(
                 run_dir,
                 project=project,
@@ -635,24 +1037,115 @@ def command_run(args: argparse.Namespace) -> int:
             )
             raise
 
+    def validate_stage(stage: str) -> list[dict[str, Any]]:
+        outcomes = run_validations(project, commands, run_dir, stage, live=live)
+        documentation = validate_development_documents(
+            project, run_dir, stage, today
+        )
+        outcomes.append(documentation)
+        all_validations.extend(outcomes)
+        if live:
+            result = "通过" if documentation["exit_code"] == 0 else "失败"
+            emit_progress("DOCS", f"中文开发文档校验{result}")
+        return outcomes
+
+    def reviewer_prompt(validations: list[dict[str, Any]]) -> str:
+        return render_prompt(
+            "reviewer.md",
+            plan=plan,
+            today=today,
+            validation=json.dumps(validations, ensure_ascii=False, indent=2),
+        )
+
+    def supervisor_takeover(
+        review_payload: dict[str, Any], reason: str
+    ) -> int:
+        nonlocal latest_review, latest_validations
+        latest_review = review_payload
+        print(f"切换 Codex 监督者：{reason}")
+        if live:
+            emit_progress("WATCHDOG", f"{reason}；Codex 接管修改")
+        guarded(
+            lambda: call_supervisor(
+                settings,
+                project,
+                render_prompt(
+                    "supervisor.md",
+                    plan=plan,
+                    today=today,
+                    review=json.dumps(
+                        review_payload, ensure_ascii=False, indent=2
+                    ),
+                ),
+                run_dir,
+            )
+        )
+        latest_validations = guarded(lambda: validate_stage("supervisor"))
+        final_review = guarded(
+            lambda: normalize_review(
+                call_reviewer(
+                    settings,
+                    project,
+                    reviewer_prompt(latest_validations),
+                    run_dir,
+                    rounds + 1,
+                ),
+                latest_validations,
+            )
+        )
+        if live:
+            emit_progress(
+                "REVIEW",
+                f"最终确认 verdict={final_review['verdict']}，"
+                f"findings={len(final_review['findings'])}",
+            )
+        status = (
+            "ready_for_user_review"
+            if final_review["verdict"] == "pass"
+            else "needs_manual_attention"
+        )
+        write_summary(
+            run_dir,
+            project=project,
+            model=model,
+            status=status,
+            review=final_review,
+            validations=all_validations,
+        )
+        if final_review["verdict"] == "pass":
+            print("PASS：Codex 接管后通过验证与最终评审，等待用户评审。")
+            return 0
+        print("BLOCKED：Codex 接管后仍有问题，需要当前任务继续处理。")
+        return 2
+
     print(f"run_dir={run_dir}")
     print(f"model={model}")
-    guarded(
-        lambda: call_local_coder(
+    if live:
+        emit_progress("WORKFLOW", f"启动受监督流程；运行记录：{run_dir}")
+        emit_progress("LOCAL", f"启动本地编码模型 {model}")
+    try:
+        ensure_model_available(model, settings.ollama_host)
+        call_local_coder(
             settings,
             project,
             model,
-            render_prompt("coder.md", plan=plan),
+            render_prompt("coder.md", plan=plan, today=today),
             run_dir,
             "coder-initial",
+            live=live,
         )
-    )
-    latest_validations = guarded(
-        lambda: run_validations(project, commands, run_dir, "coder-initial")
-    )
-    all_validations.extend(latest_validations)
+    except Exception as exc:
+        return supervisor_takeover(
+            watchdog_review(run_dir, "coder-initial", exc),
+            "本地 AI 启动、运行或响应异常",
+        )
+    if live:
+        emit_progress("LOCAL", "初始编码阶段结束，开始项目验证")
+    latest_validations = guarded(lambda: validate_stage("coder-initial"))
 
     for round_number in range(1, rounds + 1):
+        if live:
+            emit_progress("REVIEW", f"开始第 {round_number} 轮独立 Code Review")
         latest_review = guarded(
             lambda: normalize_review(
                 call_reviewer(
@@ -661,6 +1154,7 @@ def command_run(args: argparse.Namespace) -> int:
                     render_prompt(
                         "reviewer.md",
                         plan=plan,
+                        today=today,
                         validation=json.dumps(
                             latest_validations, ensure_ascii=False, indent=2
                         ),
@@ -671,6 +1165,12 @@ def command_run(args: argparse.Namespace) -> int:
                 latest_validations,
             )
         )
+        if live:
+            emit_progress(
+                "REVIEW",
+                f"第 {round_number} 轮 verdict={latest_review['verdict']}，"
+                f"findings={len(latest_review['findings'])}",
+            )
         if latest_review["verdict"] == "pass":
             write_summary(
                 run_dir,
@@ -683,77 +1183,38 @@ def command_run(args: argparse.Namespace) -> int:
             print("PASS：已通过独立 Code Review，等待用户评审。")
             return 0
         if round_number < rounds:
-            guarded(
-                lambda: call_local_coder(
+            if live:
+                emit_progress("LOCAL", "评审未通过，将 findings 返回本地模型修复")
+            try:
+                call_local_coder(
                     settings,
                     project,
                     model,
                     render_prompt(
                         "fixer.md",
                         plan=plan,
+                        today=today,
                         review=json.dumps(latest_review, ensure_ascii=False, indent=2),
                     ),
                     run_dir,
                     f"local-fix-{round_number}",
+                    live=live,
                 )
-            )
+            except Exception as exc:
+                return supervisor_takeover(
+                    watchdog_review(
+                        run_dir, f"local-fix-{round_number}", exc
+                    ),
+                    "本地 AI 修复阶段异常",
+                )
             latest_validations = guarded(
-                lambda: run_validations(
-                    project, commands, run_dir, f"local-fix-{round_number}"
-                )
+                lambda: validate_stage(f"local-fix-{round_number}")
             )
-            all_validations.extend(latest_validations)
 
     assert latest_review is not None
-    print("本地模型两轮评审后仍有问题，切换监督者修复。")
-    guarded(
-        lambda: call_supervisor(
-            settings,
-            project,
-            render_prompt(
-                "supervisor.md",
-                plan=plan,
-                review=json.dumps(latest_review, ensure_ascii=False, indent=2),
-            ),
-            run_dir,
-        )
+    return supervisor_takeover(
+        latest_review, "本地模型达到两轮 Code Review 失败阈值"
     )
-    latest_validations = guarded(
-        lambda: run_validations(project, commands, run_dir, "supervisor")
-    )
-    all_validations.extend(latest_validations)
-    final_review = guarded(
-        lambda: normalize_review(
-            call_reviewer(
-                settings,
-                project,
-                render_prompt(
-                    "reviewer.md",
-                    plan=plan,
-                    validation=json.dumps(
-                        latest_validations, ensure_ascii=False, indent=2
-                    ),
-                ),
-                run_dir,
-                rounds + 1,
-            ),
-            latest_validations,
-        )
-    )
-    status = "ready_for_user_review" if final_review["verdict"] == "pass" else "needs_manual_attention"
-    write_summary(
-        run_dir,
-        project=project,
-        model=model,
-        status=status,
-        review=final_review,
-        validations=all_validations,
-    )
-    if final_review["verdict"] == "pass":
-        print("PASS：监督者修复后通过最终评审，等待用户评审。")
-        return 0
-    print("BLOCKED：监督者修复后仍有问题，需要当前 Codex 任务人工处理。")
-    return 2
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -774,6 +1235,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--plan", required=True)
     run.add_argument("--model", default="primary", help="模型别名或 Ollama 模型 ID")
     run.add_argument("--allow-dirty", action="store_true")
+    run.add_argument(
+        "--live",
+        action="store_true",
+        help="实时显示经过脱敏的模型与工作流事件；完整原始输出仍写入日志",
+    )
     run.set_defaults(func=command_run)
     return parser
 

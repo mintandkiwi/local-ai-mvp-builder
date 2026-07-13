@@ -7,12 +7,16 @@ flowchart LR
     U["用户确认项目"] --> P["Codex 编写并批准计划"]
     P --> L["本地 Qwen + Codex CLI coding"]
     L --> T["项目测试与静态检查"]
-    T --> R["Codex 结构化 Code Review"]
+    T --> D["中文开发日志 + AI 大纲/任务规划校验"]
+    D --> R["Codex 结构化 Code Review"]
     R -->|"通过"| H["交付用户评审"]
     R -->|"第 1 轮失败"| F["findings 返回本地模型修复"]
     F --> T
     R -->|"第 2 轮仍失败"| S["Codex 监督者亲自修复"]
+    L -->|"启动失败/报错/停滞 300 秒"| W["看门狗"]
+    W --> S
     S --> T
+    H --> V["用户验收后准备 Git/GitHub 发布"]
 ```
 
 ## 阶段与验收
@@ -34,6 +38,10 @@ flowchart LR
 6. 人工交付
    - 最终状态只能是 `ready_for_user_review` 或 `needs_manual_attention`。
    - 验收：不 commit、不 push，用户可以直接检查 diff 和运行摘要。
+7. 文档与版本交付
+   - 每次开发更新中文当日日志、AI 项目大纲和 AI 任务规划。
+   - `summary.json` 记录分支、基线提交、remote 名称和建议提交信息。
+   - 验收：文档缺失或未更新时阻止交付；只有用户明确批准后才能 commit、push 或创建 GitHub PR。
 
 ## 每个新项目的输入契约
 
@@ -41,6 +49,7 @@ flowchart LR
 - 一份经过用户批准的 Markdown 项目计划，包含范围、非目标和验收标准。
 - 仓库根目录的 `AGENTS.md`，声明开发与 review 规则。
 - `.mvp-ai.toml` 中真实可运行的验证命令。
+- 本次开发必须更新 `docs/devlog/YYYY-MM-DD.md`、`docs/ai/PROJECT_OUTLINE.md` 和 `docs/ai/TASK_PLAN.md`。
 
 ## 主要风险与控制
 
@@ -48,8 +57,11 @@ flowchart LR
 | --- | --- |
 | 模型越权或误删 | workspace-write 沙箱；禁止危险绕过参数；干净 Git 基线 |
 | 本地模型反复修不好 | 两轮上限，之后监督者接管 |
+| 本地模型崩溃或假死 | 结构化事件看门狗；300 秒无有效进展或命令失败后立即由 Codex 接管 |
 | 测试被弱化以“通过” | 提示词禁止删除/弱化测试，独立 review 检查测试有效性 |
 | 长上下文导致 OOM | Codex 本地调用强制 32K context，同时只驻留一个模型 |
 | 日志污染 diff | 所有运行记录保存在目标仓库之外 |
 | 意外发布 | 编排器没有 commit/push 步骤，最终必须人工评审 |
+| 开发上下文丢失 | 中文当日日志 + AI 项目大纲 + AI 任务规划作为强制验证项 |
+| Codex 状态转述消耗 token | Skill 默认 summary 模式，只汇报阶段、异常、Review 与最终结果 |
 | 代理误伤 localhost | Codex 子进程固定 `NO_PROXY/no_proxy=localhost,127.0.0.1,::1` |

@@ -1,6 +1,7 @@
 [workflow]
 max_local_review_rounds = 2
 coder_timeout_seconds = 3600
+local_stall_timeout_seconds = 300
 review_timeout_seconds = 1800
 supervisor_timeout_seconds = 3600
 require_clean_worktree = true

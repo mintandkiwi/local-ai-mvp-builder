@@ -8,7 +8,16 @@ if nc -z 127.0.0.1 7890 >/dev/null 2>&1; then
   export ALL_PROXY=${ALL_PROXY:-socks5://127.0.0.1:7890}
 fi
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SOURCE=$0
+while [ -h "$SOURCE" ]; do
+  SOURCE_DIR=$(CDPATH= cd -- "$(dirname -- "$SOURCE")" && pwd)
+  LINK=$(readlink "$SOURCE")
+  case "$LINK" in
+    /*) SOURCE=$LINK ;;
+    *) SOURCE=$SOURCE_DIR/$LINK ;;
+  esac
+done
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SOURCE")" && pwd)
 python3 "$SCRIPT_DIR/../src/fast_pull.py" qwen3-coder:30b
 
 if [ "${1:-}" = "--with-secondary" ]; then
