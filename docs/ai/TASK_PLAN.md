@@ -2,38 +2,42 @@
 
 ## 当前里程碑
 
-里程碑 M2：完成可长期复用的低 token 本地 AI 开发闭环，并准备用户验收后的 GitHub 交付。
+里程碑 M3：完成 Local AI MVP Builder 跨 Agent 开源部署实现，关闭自动运行遗留 finding 并取得新的独立 Review。
 
 ## 已完成
 
-- `M2-01`：部署 Qwen 主模型和备选模型。
-- `M2-02`：实现计划导入、本地编码、项目验证和结构化 Code Review。
-- `M2-03`：实现两轮本地修复阈值及 Codex 监督者接管。
-- `M2-04`：实现安全实时事件流和简洁输出模式。
-- `M2-05`：实现中文当日日志、AI 项目大纲和 AI 任务规划契约。
-- `M2-06`：实现本地模型 300 秒停滞看门狗与失败接管。
-- `M2-07`：实现不包含 remote URL 的 Git 版本快照。
-- `M2-08`：完成 29 项单元测试和 Skill 格式校验。
+- `M2-01` 至 `M2-08`：完成本地模型、两轮受监督编排、结构化 Review、看门狗、中文文档契约、安全版本快照和原有 29 项回归基线。
+- `M3-01`：建立 `integrations/skills/local-ai-mvp-builder/` 唯一 Skill 源，删除备份副本和个人目录维护依赖。
+- `M3-02`：加入公共 Agent Skills frontmatter、Agent 无关计划目录、固定门禁、参考文档和 Codex UI 元数据。
+- `M3-03`：实现可从任意 cwd 和软链接启动的 `mvp-loop-supervised`，正确映射 summary/live 并拒绝脏工作区绕过。
+- `M3-04`：实现 Codex、Claude Code、Antigravity IDE、Antigravity CLI 四平台路径映射和 `~/.local/bin` 入口。
+- `M3-05`：实现安装 dry-run、幂等升级、普通冲突拒绝、`--force` 原子备份、失败回滚、软链接父目录保护和部分失败汇总。
+- `M3-06`：用临时 HOME 与临时 Git 项目直接测试真实入口，覆盖四平台、冲突、备份、软链接、参数映射、缺失文件和 untracked 门禁。
+- `M3-07`：更新 README 的依赖、安装、调用、升级、卸载、恢复、平台差异与 reviewer/supervisor 边界。
+- `M3-08`：增加署名为 Yancy Chan 的 MIT `LICENSE`，确认 `.gitignore` 继续排除 `runs/`、缓存和系统文件。
+- `M3-09`：更新当日中文日志、AI 项目大纲和任务规划。
+- `M3-10`：人工接管修复共享 Skill 非 Codex 接管边界，并在统一配置解析中拒绝空白验证命令。
+- `M3-11`：原生环境 44 项测试全部通过，Python 编译与四个 Shell 入口语法通过；故障注入覆盖安装失败后的原 Skill 恢复路径。
+- `M3-12`：受监督验证沙箱通过（44 项通过、2 项因父级 Seatbelt 精确跳过），人工修复后的独立 Review verdict 为 `pass`，没有新的 P0/P1/P2。
+- `M3-13`：将唯一 Skill 源安装到 Codex、Claude Code、Antigravity IDE 和 Antigravity CLI，核对四个平台文件与统一 PATH 入口；旧 Codex Skill 已生成可恢复备份。
 
 ## 进行中
 
-- `M2-09`：等待用户评审工作流升级和文档结构。
+- `M3-14`：公开 GitHub 仓库已创建并配置为 `origin`，正在提交、推送 `main`/功能分支并创建 Draft PR。
 
 ## 待办
 
-- `M2-10`：根据用户意见调整文档字段、看门狗阈值或状态汇报粒度。
-- `M2-11`：用户确认后生成正式 Conventional Commit。
-- `M2-12`：按用户指定的仓库、可见性和分支策略上传 GitHub并创建 Draft PR。
-- `M3-01`：使用首个真实 MVP 验证长任务接管、每日多次日志追加和发布流程。
+- `M4-01`：用首个真实 MVP 验证长任务接管、同日多次日志追加和发布闭环。
 
 ## 验收标准
 
-- 本地模型正常时，完成代码、测试和三份中文文档后才允许 Review 通过。
-- 本地模型失败或 300 秒无结构化进展时，Codex 自动接管，不要求用户重新启动流程。
-- Codex 对话不复制本地模型运行细节，只报告关键阶段和异常。
-- `summary.json` 包含最终状态、验证、Git diff 和安全版本快照。
-- 未得到用户授权时不存在自动 commit、push、tag 或 GitHub 仓库创建行为。
+- `SKILL.md` 首行是有效 YAML frontmatter，不含个人路径或前端专属计划目录，仓库中不存在第二 Skill 副本。
+- `mvp-loop-supervised --help` 可从任意 cwd 和软链接调用；正式执行验证目标项目、完整脏状态、计划、配置与 doctor。
+- 临时 HOME 中四平台安装、dry-run、幂等、冲突拒绝、force 备份和恢复证据可靠，测试不写真实用户配置。
+- 原有编排、安全、看门狗和文档回归继续有效，新增真实跨 Agent 测试通过。
+- README、MIT License、中文日志和 AI 文档与当前 diff 及验证证据一致。
+- 版本管理操作只按用户本轮明确授权执行；不创建 tag/release，不改写 Git 历史，功能变更先通过 Draft PR 交付。
 
 ## 下一步
 
-请用户检查本次新增的日志、AI 文档、看门狗和 GitHub 交付规则。确认后再决定是否创建本地提交以及上传到哪个 GitHub 仓库。
+完成 Conventional Commit，先推送 `main` 基线，再推送 `agent/cross-agent-skill` 并创建 Draft PR；发布后把实际仓库和 PR 地址回写到中文日志。

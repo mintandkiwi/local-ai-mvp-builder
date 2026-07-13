@@ -1,0 +1,4 @@
+interface:
+  display_name: "Local AI MVP Builder"
+  short_description: "用本地 Qwen 编码并由 Codex 监督、评审和接管 MVP 开发"
+  default_prompt: "Use $local-ai-mvp-builder to implement this project through the supervised local-AI workflow."

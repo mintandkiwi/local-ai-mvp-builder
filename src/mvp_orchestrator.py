@@ -400,6 +400,10 @@ def load_validation_commands(project: Path) -> list[str]:
     commands = raw.get("validation", {}).get("commands", [])
     if not isinstance(commands, list) or not all(isinstance(c, str) for c in commands):
         raise WorkflowError(".mvp-ai.toml 中 validation.commands 必须是字符串数组")
+    if not commands or any(not command.strip() for command in commands):
+        raise WorkflowError(
+            ".mvp-ai.toml 中 validation.commands 必须至少包含一条非空验证命令"
+        )
     return commands
 
 
@@ -450,6 +454,7 @@ def write_validation_profile(project: Path, run_dir: Path) -> Path:
         Path("/Library"),
         Path("/Applications"),
         Path("/opt/homebrew"),
+        Path("/private/var/select"),
         *user_toolchain_read_roots(home),
     ]
     lines = [
@@ -468,6 +473,16 @@ def write_validation_profile(project: Path, run_dir: Path) -> Path:
         for path in allowed_reads
         if path.exists()
     )
+    read_ancestors = {
+        parent
+        for path in allowed_reads
+        if path.exists()
+        for parent in path.resolve().parents
+    }
+    lines.extend(
+        f'(allow file-read* (literal "{seatbelt_escape(path)}"))'
+        for path in sorted(read_ancestors, key=str)
+    )
     lines.extend(
         f'(deny file-read* (regex #"{pattern}"))'
         for pattern in project_secret_regexes(project)
@@ -485,8 +500,10 @@ def validation_environment(run_dir: Path) -> dict[str, str]:
     run_dir = run_dir.resolve()
     safe_home = run_dir / "validation-home"
     safe_tmp = run_dir / "validation-tmp"
+    safe_bin = run_dir / "validation-bin"
     safe_home.mkdir(exist_ok=True)
     safe_tmp.mkdir(exist_ok=True)
+    safe_bin.mkdir(exist_ok=True)
     allowed = {
         "PATH",
         "LANG",
@@ -496,6 +513,11 @@ def validation_environment(run_dir: Path) -> dict[str, str]:
         "DEVELOPER_DIR",
     }
     env = {key: value for key, value in os.environ.items() if key in allowed}
+    developer_git = Path("/Applications/Xcode.app/Contents/Developer/usr/bin/git")
+    git_link = safe_bin / "git"
+    if developer_git.is_file() and not git_link.exists():
+        git_link.symlink_to(developer_git)
+    env["PATH"] = f"{safe_bin}{os.pathsep}{env.get('PATH', '')}"
     env.update(
         {
             "HOME": str(safe_home),
@@ -509,6 +531,7 @@ def validation_environment(run_dir: Path) -> dict[str, str]:
             "PIP_CACHE_DIR": str(safe_tmp / "pip-cache"),
             "UV_CACHE_DIR": str(safe_tmp / "uv-cache"),
             "NPM_CONFIG_CACHE": str(safe_tmp / "npm-cache"),
+            "MVP_VALIDATION_SANDBOX": "1",
         }
     )
     return env
@@ -953,6 +976,20 @@ def command_doctor(args: argparse.Namespace) -> int:
     return 0 if all(checks[name] for name in ("codex", "ollama", "aria2c", "git")) else 1
 
 
+def command_check_config(args: argparse.Namespace) -> int:
+    project = Path(args.project).expanduser().resolve()
+    if not project.is_dir():
+        raise WorkflowError(f"项目目录不存在：{project}")
+    commands = load_validation_commands(project)
+    print(
+        json.dumps(
+            {"project": str(project), "validation_commands": len(commands)},
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def command_init(args: argparse.Namespace) -> int:
     project = Path(args.project).expanduser().resolve()
     if not project.exists():
@@ -1225,6 +1262,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = subparsers.add_parser("doctor", help="检查 Codex、Ollama、Git 与本地模型")
     doctor.set_defaults(func=command_doctor)
+
+    check_config = subparsers.add_parser(
+        "check-config", help="检查项目是否配置了真实验证命令"
+    )
+    check_config.add_argument("--project", required=True)
+    check_config.set_defaults(func=command_check_config)
 
     init = subparsers.add_parser("init", help="初始化目标 Git 项目的 AI 工作流文件")
     init.add_argument("--project", required=True)

@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -93,10 +94,11 @@ class OrchestratorTests(unittest.TestCase):
         self.assertNotIn("{{TODAY}}", prompt)
 
     def test_live_redaction_masks_common_credentials(self):
+        token_fixture = "ghp_" + ("x" * 30)
         text = MODULE.redact_live_text(
             "OPENAI_API_KEY=top-secret AWS_SECRET_ACCESS_KEY=aws-secret "
             "password: hunter2 "
-            "token=ghp_abcdefghijklmnopqrstuvwxyz123456"
+            f"token={token_fixture}"
         )
         self.assertNotIn("top-secret", text)
         self.assertNotIn("aws-secret", text)
@@ -155,6 +157,10 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIn("模型说明：safe progress", output.getvalue())
             self.assertIn("safe progress", log_path.read_text(encoding="utf-8"))
 
+    @unittest.skipIf(
+        os.environ.get("MVP_VALIDATION_SANDBOX") == "1",
+        "父级验证 Seatbelt 不允许向子进程发送 SIGKILL",
+    )
     def test_monitor_kills_stalled_local_process(self):
         with tempfile.TemporaryDirectory() as directory:
             log_path = Path(directory) / "stalled.log"
@@ -232,6 +238,17 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(
                 MODULE.load_validation_commands(project), ["python -m unittest"]
             )
+
+    def test_validation_config_rejects_blank_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            for commands in ("[]", '["   "]', '["python -m unittest", ""]'):
+                (project / ".mvp-ai.toml").write_text(
+                    f"[validation]\ncommands = {commands}\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaises(MODULE.WorkflowError):
+                    MODULE.load_validation_commands(project)
 
     def test_development_document_contract(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -410,6 +427,10 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIn("(deny file-read* (regex", profile)
         self.assertIn("service", profile)
 
+    @unittest.skipIf(
+        os.environ.get("MVP_VALIDATION_SANDBOX") == "1",
+        "父级验证 Seatbelt 中不能可靠嵌套 sandbox-exec",
+    )
     @unittest.skipUnless(sys.platform == "darwin", "requires macOS sandbox-exec")
     def test_validation_sandbox_denies_nested_secrets(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -439,8 +460,16 @@ class OrchestratorTests(unittest.TestCase):
                 ["sandbox-exec", "-f", str(profile), "/bin/zsh", "-lc", command],
                 cwd=project,
                 env=MODULE.validation_environment(run_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
                 check=False,
             )
+            if (
+                result.returncode == 71
+                and "sandbox_apply: Operation not permitted" in result.stderr
+            ):
+                self.skipTest("父级 Seatbelt 不允许嵌套 sandbox-exec")
             self.assertEqual(result.returncode, 0)
             original = (project / "nested" / ".env.test").read_text()
             for mutation in (
