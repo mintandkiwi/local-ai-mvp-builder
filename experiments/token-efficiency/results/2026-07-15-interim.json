@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "as_of": "2026-07-15",
+  "report_status": "interim",
+  "efficiency_claim": "inconclusive",
+  "acceptance_threshold": {
+    "paired_tasks_required": 3,
+    "cloud_token_median_saving_percent": 25,
+    "quality_equivalence_required": true,
+    "complete_measurement_required": true
+  },
+  "method": {
+    "arms": ["local-first", "direct-codex"],
+    "same_base_within_pair": true,
+    "same_plan_validation_hidden_evaluator_and_final_review": true,
+    "counterbalanced_order_registered_before_execution": true,
+    "workflow_revision_stable_within_observed_pair": false,
+    "public_model_identity": "deployment aliases only"
+  },
+  "completed_pairs": [
+    {
+      "task": "slug-normalizer",
+      "risk": "low",
+      "eligible_for_acceptance_statistics": false,
+      "exclusion_reason": "The Skill working revision changed between arms during validation-driven remediation.",
+      "quality": {
+        "local_first_success": true,
+        "direct_codex_success": true,
+        "hidden_evaluator_passed_both": true,
+        "baseline_test_unchanged_both": true,
+        "final_review_passed_both": true
+      },
+      "local_first": {
+        "cloud_tokens": 1025809,
+        "local_tokens": 681342,
+        "cloud_calls": 3,
+        "wall_seconds": 1112.14,
+        "first_review_blocking_findings": 7,
+        "takeover": true
+      },
+      "direct_codex": {
+        "cloud_tokens": 917581,
+        "cloud_calls": 4,
+        "wall_seconds": 779.88,
+        "first_review_blocking_findings": 2
+      },
+      "paired_result": {
+        "cloud_token_saving_percent": -11.79,
+        "local_first_wall_time_change_percent": 42.6,
+        "interpretation": "local-first used more cloud Tokens and more wall time"
+      }
+    }
+  ],
+  "partial_runs": [
+    {
+      "task": "retry-schedule",
+      "risk": "medium",
+      "arm": "direct-codex",
+      "status": "needs_manual_attention",
+      "cloud_token_lower_bound": 552605,
+      "measurement_complete": false,
+      "completed_cloud_stages": 2,
+      "failed_stage": "direct-fixer",
+      "failure_classification": "cloud_usage_limit",
+      "excluded_from_pair_statistics": true
+    }
+  ],
+  "not_run": [
+    {
+      "task": "retry-schedule",
+      "arm": "local-first",
+      "reason": "stopped after cloud quota interruption to avoid incomparable evidence"
+    },
+    {
+      "task": "record-batcher",
+      "arm": "local-first",
+      "reason": "stopped after cloud quota interruption to avoid incomparable evidence"
+    },
+    {
+      "task": "record-batcher",
+      "arm": "direct-codex",
+      "reason": "stopped after cloud quota interruption to avoid incomparable evidence"
+    }
+  ],
+  "conclusion": {
+    "operationally_completed_pairs": 1,
+    "eligible_complete_pairs": 0,
+    "required_pairs": 3,
+    "measured_saving_validated": false,
+    "reason": "The only operationally complete pair regressed but is exploratory because the workflow revision changed between arms; the remaining experiment was interrupted by an external cloud quota limit."
+  }
+}

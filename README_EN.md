@@ -141,6 +141,8 @@ Run records live outside the target workspace under `~/.local/share/local-ai-mvp
 
 Configure `cloud.soft_token_budget` in `config/defaults.toml`; zero means unset. `cloud.max_calls_per_run` limits cloud calls. The soft budget warns but never interrupts a security or data fix midway. Incomplete telemetry makes the budget status `unknown`, not “within budget.” An ordinary run must keep `efficiency.claim` as `no_baseline`. Only a separately approved, equal-task direct-Codex comparison with complete measurements may report `measured_saving`; otherwise the result is `no_baseline`, `inconclusive`, or `regression`. Local Tokens must not be converted into claimed cloud savings.
 
+See the public [2026-07-15 Token-efficiency A/B interim report](docs/reports/token-efficiency-ab-2026-07-15-en.md). In one exploratory observation, local-first used 11.79% more cloud Tokens, but the Skill working revision drifted between arms and later samples stopped after an external quota interruption. The eligible pair count is 0/3, so the result is `inconclusive` and must not be advertised as validated savings.
+
 ## Documentation Contract for Every Development Run
 
 Every successful run must update:

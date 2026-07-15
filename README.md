@@ -141,6 +141,8 @@ mvp-loop-supervised \
 
 `config/defaults.toml` 可配置 `cloud.soft_token_budget`（0 表示未配置）和 `cloud.max_calls_per_run`。软预算只告警，不会在安全或数据修复中途强制退出；计量不完整时预算状态为 `unknown`，不能宣称“仍在预算内”。普通单次运行的 `efficiency.claim` 必须是 `no_baseline`。只有另获 Token 预算批准、使用同等任务 direct-Codex 对照且两组计量完整时，才允许标记 `measured_saving`；否则只能是 `no_baseline`、`inconclusive` 或 `regression`，本地 Token 不能换算成云端节省。
 
+公开 A/B 证据见 [2026-07-15 Token 效率阶段性报告](docs/reports/token-efficiency-ab-2026-07-15.md)。一组探索性观测中 local-first 的云端 Token 高 11.79%，但两臂间 Skill 工作版本发生修复漂移，后续样本又因外部额度中断；因此有效完整配对为 0/3，结论为 `inconclusive`，不得宣传“Token 节省已验证”。
+
 ## 每次开发的文档契约
 
 每次成功运行都必须更新：

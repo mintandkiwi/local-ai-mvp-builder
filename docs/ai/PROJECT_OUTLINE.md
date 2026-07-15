@@ -33,10 +33,12 @@
 - `tests/test_orchestrator.py`：Token、summary、预检、风险、自适应路由、watchdog、capsule 和安全回归。
 - `tests/test_cross_agent_integration.py`：Skill 包、启动器和四平台安装回归。
 - `README.md`、`README_EN.md`：面向用户的中英文安装、运行、安全和恢复说明，并提供双向语言切换；公开内容使用部署无关表述，不披露维护者机器参数或具体模型配置。
+- `experiments/token-efficiency/run_ab.py`：准备和执行等价 local-first/direct-cloud A/B，原始证据写入仓库外，仅输出脱敏聚合结果。
+- `docs/reports/token-efficiency-ab-2026-07-15.md`、英文对应报告：公开阶段性实测方法、结果、限制和复验要求。
 
 ## 约束
 
-- 默认不自动 commit、push、切换分支、改写历史、发布或创建 PR；本次 GitHub 发布只在用户明确授权的当前分支和变更范围内执行，本轮不执行真实云端 A/B。
+- 默认不自动 commit、push、切换分支、改写历史、发布或创建 PR；本次 GitHub 发布和真实云端 A/B 仅在用户明确授权的当前分支、实验范围和 Token 边界内执行，不合并、不创建 tag 或 release。
 - 现有 P0–P2 阻塞标准、项目验证、中文三文档和接管后的独立终审不得降低。
 - Token 未知不能记为 0；partial/unavailable 不能称为完整，计量不完整时不能宣称在预算内。
 - 单次运行默认 `efficiency.claim = no_baseline`；没有另行批准且完整计量的等价 direct-Codex 对照，不得宣称节省或换算费用。
@@ -45,4 +47,4 @@
 
 ## 当前状态
 
-TE-001 至 TE-009 模拟验收已落盘。独立 `review-4` 至 `review-35` 共报告 25 个 P1、77 个 P2；`review-15`、`review-26` 因 usage limit 无 verdict，其余 finding 均已针对性修复，原生回归由 68 项增至 143 项并全部通过。`review-36` 核验 12 项门禁、完整证据哈希和冻结快照后返回 `pass`、0 finding，外部 summary 状态为 `ready_for_user_review`。当前 discoverable Skill backup 已迁出。最终实现完全排除基线原 `.git`；允许的原 HEAD blob 形成无父合成 HEAD，当前 index blob 形成合成 index，真实工作树保留 staged/unstaged/untracked 与 diff-check 语义。验证前预存根/嵌套 `.git` 全部封锁，普通根项目路径走私有 `GIT_DIR`，严格子路径 `init/clone` 和验证中新建子仓库按自身目录发现。安装器在任何迁移前预检全部目标，并对迁移中途或后续安装失败执行事务回滚。中英文 README 已完成并互相链接，公开说明已移除维护者机器参数、具体模型与个人代理信息；Draft PR #1 等待用户评审。TE-010 未获真实 A/B Token 预算授权，不能称“Token 节省已验证”。
+TE-001 至 TE-009 模拟验收已落盘。独立 `review-4` 至 `review-35` 共报告 25 个 P1、77 个 P2；`review-15`、`review-26` 因 usage limit 无 verdict，其余 finding 均已针对性修复，原生回归由 68 项增至 143 项并全部通过。`review-36` 核验 12 项门禁、完整证据哈希和冻结快照后返回 `pass`、0 finding，外部 summary 状态为 `ready_for_user_review`。当前 discoverable Skill backup 已迁出。最终实现完全排除基线原 `.git`；允许的原 HEAD blob 形成无父合成 HEAD，当前 index blob 形成合成 index，真实工作树保留 staged/unstaged/untracked 与 diff-check 语义。验证前预存根/嵌套 `.git` 全部封锁，普通根项目路径走私有 `GIT_DIR`，严格子路径 `init/clone` 和验证中新建子仓库按自身目录发现。安装器在任何迁移前预检全部目标，并对迁移中途或后续安装失败执行事务回滚。中英文 README 已完成并互相链接，公开说明已移除维护者机器参数、具体模型与个人代理信息；Draft PR #1 等待用户评审。TE-010 产生 1 组运行完整的探索性观测：两条路线质量门槛等价通过，local-first 云端 Token 增加 11.79%、墙钟时间增加 42.60%，但 Skill 工作版本在两臂之间发生修复漂移，故不计入正式统计。第二组受外部云端用量限制中断，其余组为保持公平未运行；有效完整配对为 0/3，当前效率结论为 `inconclusive`，不能称“Token 节省已验证”。实验 harness 已增加干净提交与 HEAD 冻结门禁，防止后续重跑再次出现版本漂移。

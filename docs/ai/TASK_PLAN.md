@@ -2,7 +2,7 @@
 
 ## 当前里程碑
 
-M4：Local AI MVP Builder Token 效率整改。目标是完成 TE-001 至 TE-009 的计量、前置止损、风险路由、自适应 review、上下文压缩和模拟验收；TE-010 真实 A/B 必须等待用户单独批准云端 Token 预算。
+M4：Local AI MVP Builder Token 效率整改。TE-001 至 TE-009 已完成；TE-010 已获用户单独授权并完成阶段性真实 A/B，但完整样本数不足，效率结论为 `inconclusive`。
 
 ## 已完成
 
@@ -19,14 +19,16 @@ M4：Local AI MVP Builder Token 效率整改。目标是完成 TE-001 至 TE-009
 - `TE-009C`：`review-36` 核验 12 项门禁、完整证据哈希和冻结快照后返回 `pass`、0 finding；summary 已达到 `ready_for_user_review`。
 - `RELEASE-001`：完成中英文 README、143 项发布前回归和辅助门禁；提交 `b295221` 已推送到 `origin/agent/cross-agent-skill`，现有 Draft PR #1 自动纳入升级。
 - `RELEASE-002`：将公开中英文 README 改为部署无关说明，移除维护者机器容量、具体模型、个人代理和硬件评估入口，保留可配置后端与 `doctor` 兼容性门禁。
+- `TE-010A`：冻结 3 组等价低/中风险任务并完成首组探索性观测；两条路线质量门槛均通过，local-first 云端 Token 比 direct-cloud 增加 11.79%。但 Skill 工作版本在两臂之间发生验证驱动修复，该观测不进入正式验收统计。第二组在 direct-cloud 修改阶段受外部用量限制中断，已记录 552,605 Token 精确下限但不纳入配对统计。
+- `TE-010-GUARD`：实验 harness 强制准备和各臂前后使用同一干净提交；HEAD 或工作树漂移时拒绝继续，并要求创建全新实验根目录。
+- `TE-010-REPORT`：生成中英文阶段性报告和机器可读汇总，公开结论为 `inconclusive`，不披露维护者机器、具体模型、私有路径或原始日志。
 
 ## 进行中
 
-- 等待用户评审 Draft PR #1；未经新的明确授权不合并、不创建 tag 或 release。
+- `TE-010B`：先冻结并提交唯一 Skill 版本；等待云端额度恢复后，从全新实验根目录重跑全部 3 组配对。未经 3 组有效完整配对和等价质量门槛，不关闭效率验证。
 
 ## 待办
 
-- `TE-010`：待用户单独批准真实云端 Token 预算后，设计至少 3 组等价低/中风险 direct-Codex 与 local-first A/B；未批准前不得执行或宣称节省。
 - `M4-FOLLOWUP`：如 A/B 中位数云端 Token 未下降 25% 或成功/安全标准不等价，将 claim 记为 `regression`/`inconclusive` 并调整路由，不关闭优化验证。
 
 ## 验收标准
@@ -41,6 +43,6 @@ M4：Local AI MVP Builder Token 效率整改。目标是完成 TE-001 至 TE-009
 
 ## 下一步
 
-用户评审 `https://github.com/mintandkiwi/local-ai-mvp-builder/pull/1`；通过后再决定是否合并到 `main`。TE-010 继续保持“待预算批准”，只有用户明确批准真实云端 Token 消耗后才创建等价 A/B 计划并执行。
+云端额度恢复后以全新实验根目录完成 3 组配对，独立复核统计与质量等价性；只有中位数云端 Token 至少下降 25% 且所有质量门槛等价通过，才允许形成节省结论。用户同时评审 `https://github.com/mintandkiwi/local-ai-mvp-builder/pull/1`；未经授权不合并到 `main`、不创建 tag 或 release。
 
 证据冻结说明：独立终审 capsule 必须在 tracked 文档停止修改后生成，因此仓库文档只记录上一轮已完成 verdict 与下一步；新一轮外部 capsule/终审结果将在冻结快照之后产生并写入权限受限的运行目录。这是内容快照不可变性约束，不应视为 tracked 状态遗漏。
