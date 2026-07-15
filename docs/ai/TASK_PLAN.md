@@ -17,10 +17,11 @@ M4：Local AI MVP Builder Token 效率整改。目标是完成 TE-001 至 TE-009
 - `TE-009A`：新增模拟回归覆盖 Token JSON/文本/缺失/损坏/重复/大整数、summary 安全、基线零调用、low/medium/high 路由、首轮 P1、局部 P2、P3-only、watchdog、quoted/多行凭据、各类私钥、reviewer 能力预检和大 capsule 脱敏/截断。
 - `TE-009B`：独立 `review-4` 至 `review-35` 共发现 25 个 P1、77 个 P2（`review-15`、`review-26` 无 verdict）；全部有效 finding 已修复，原生回归由 68 项增至 143 项，并覆盖外置证据、内容快照、风险/类别策略、凭据脱敏、去敏 Git 视图、子仓库路由和事务安装。
 - `TE-009C`：`review-36` 核验 12 项门禁、完整证据哈希和冻结快照后返回 `pass`、0 finding；summary 已达到 `ready_for_user_review`。
+- `RELEASE-001`：完成中英文 README、143 项发布前回归和辅助门禁；提交 `b295221` 已推送到 `origin/agent/cross-agent-skill`，现有 Draft PR #1 自动纳入升级。
 
 ## 进行中
 
-- `RELEASE-001`：根据用户明确授权，完成中英文 README、重跑发布前门禁，并将当前分支提交、推送后创建面向 `main` 的 Draft PR。
+- 等待用户评审 Draft PR #1；未经新的明确授权不合并、不创建 tag 或 release。
 
 ## 待办
 
@@ -39,6 +40,6 @@ M4：Local AI MVP Builder Token 效率整改。目标是完成 TE-001 至 TE-009
 
 ## 下一步
 
-中英文 README 已完成；重新运行发布前门禁后，提交并推送 `agent/cross-agent-skill`，创建面向 `main` 的 Draft PR 供用户检查。TE-010 继续保持“待预算批准”，只有用户明确批准真实云端 Token 消耗后才创建等价 A/B 计划并执行。
+用户评审 `https://github.com/mintandkiwi/local-ai-mvp-builder/pull/1`；通过后再决定是否合并到 `main`。TE-010 继续保持“待预算批准”，只有用户明确批准真实云端 Token 消耗后才创建等价 A/B 计划并执行。
 
 证据冻结说明：独立终审 capsule 必须在 tracked 文档停止修改后生成，因此仓库文档只记录上一轮已完成 verdict 与下一步；新一轮外部 capsule/终审结果将在冻结快照之后产生并写入权限受限的运行目录。这是内容快照不可变性约束，不应视为 tracked 状态遗漏。
