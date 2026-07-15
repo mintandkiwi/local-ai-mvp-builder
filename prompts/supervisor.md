@@ -11,6 +11,8 @@
 7. 高风险计划由你负责关键模块实现；严格遵守计划列出的高风险文件和职责边界，不把关键实现回交本地模型。
 8. 不读取或输出 `.env`、凭据文件、私钥、认证配置和私有远程地址；不得把这些内容写入日志、summary 或文档。
 9. 只要 capsule 含 path/SHA-256 证据，就逐项核对 plan、scope、validation manifest、manifest 内每个 validation log 和 review 证据；相对路径用 `evidence_base_dir` 解析。任一缺失或不一致时停止并记录证据完整性失败。
+10. `supervisor` capsule 若标记 `validation_phase=pre_implementation_baseline`，其中 artifacts 只证明修改前已配置命令；计划要求新增的命令列在 `planned_post_edit_commands`，它们尚无日志不是证据缺失。你必须在实现阶段补齐对应脚本/配置，随后由编排器重新加载 `.mvp-ai.toml` 并在 post-edit validation 中真实执行。
+11. `allowed_files` 同时包含计划明确命名的文件与目录前缀。目录前缀授权在该目录内创建计划要求的新文件，但不得扩展到计划未列出的模块或任何敏感路径。
 
 完整计划保存在以下只读路径，请按需读取且不要复述全文：
 

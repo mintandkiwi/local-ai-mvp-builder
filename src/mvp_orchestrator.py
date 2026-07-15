@@ -2291,6 +2291,84 @@ def git_changed_files(project: Path) -> list[str]:
     )
 
 
+def plan_declared_project_paths(project: Path, plan_path: Path) -> list[str]:
+    """Return safe repository-relative paths explicitly named by the plan.
+
+    Direct-cloud routes start from a clean tree, so changed files and review
+    findings alone cannot describe the supervisor's approved mutation scope.
+    Inline-code paths in the approved plan provide that missing evidence. A
+    named directory is retained as a prefix and expanded to its current files;
+    planned new files must still be named explicitly or live below that prefix.
+    """
+    try:
+        text = plan_path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+
+    safe_basenames = {
+        ".mvp-ai.toml",
+        ".gitignore",
+        "package.json",
+        "package-lock.json",
+        "PRIVACY.md",
+        "README.md",
+    }
+    declared: set[str] = set()
+    for match in re.finditer(r"`([^`\r\n]+)`", text):
+        raw = match.group(1).strip().replace("\\", "/")
+        if (
+            not raw
+            or any(character.isspace() for character in raw)
+            or raw.startswith(("$", "-", "http://", "https://"))
+        ):
+            continue
+        is_directory = raw.endswith("/")
+        normalized = raw.rstrip("/")
+        relative = Path(normalized)
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or ".." in relative.parts
+            or is_baseline_secret_path(relative)
+        ):
+            continue
+        if (
+            "/" not in normalized
+            and normalized not in safe_basenames
+            and not relative.suffix
+        ):
+            continue
+
+        if is_directory:
+            prefix = relative.as_posix().rstrip("/") + "/"
+            declared.add(prefix)
+            root = project / relative
+            if root.is_dir():
+                for candidate in root.rglob("*"):
+                    if not candidate.is_file():
+                        continue
+                    candidate_relative = candidate.relative_to(project)
+                    if not is_baseline_secret_path(candidate_relative):
+                        declared.add(candidate_relative.as_posix())
+            continue
+        declared.add(relative.as_posix())
+    return sorted(declared)
+
+
+def plan_declared_validation_commands(plan_path: Path) -> list[str]:
+    """Extract exact planned post-edit validation commands from inline code."""
+    try:
+        text = plan_path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    commands: list[str] = []
+    for match in re.finditer(r"`([^`\r\n]+)`", text):
+        command = match.group(1).strip()
+        if command.startswith(("npm ", "node ", "git ", "python ", "python3 ")):
+            commands.append(command)
+    return list(dict.fromkeys(commands))
+
+
 def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -2505,11 +2583,18 @@ def write_context_capsule(
                 }
             )
     validation_manifest_path = run_dir / f"context-{stage}-validation.json"
+    planned_validation_commands = plan_declared_validation_commands(plan_path)
     validation_manifest_text = json.dumps(
         sanitize_json_value(
             {
                 "schema_version": 1,
                 "stage": stage,
+                "validation_phase": (
+                    "pre_implementation_baseline"
+                    if stage == "supervisor" and not changed_files
+                    else "post_implementation"
+                ),
+                "planned_post_edit_commands": planned_validation_commands,
                 "artifacts": validation_artifacts,
             }
         ),
@@ -2520,8 +2605,10 @@ def write_context_capsule(
     validation_manifest_sha256 = hashlib.sha256(
         validation_manifest_text.encode("utf-8")
     ).hexdigest()
+    plan_declared_paths = plan_declared_project_paths(project, plan_path)
     allowed_files = sorted(
         set(changed_files)
+        | set(plan_declared_paths)
         | {
             str(item.get("file"))
             for item in (review or {}).get("findings", [])
@@ -2554,6 +2641,13 @@ def write_context_capsule(
             "risk": risk,
             "changed_files": changed_files,
             "allowed_files": allowed_files,
+            "plan_declared_paths": plan_declared_paths,
+            "planned_post_edit_commands": planned_validation_commands,
+            "validation_phase": (
+                "pre_implementation_baseline"
+                if stage == "supervisor" and not changed_files
+                else "post_implementation"
+            ),
             "validation_failures": validation_failures,
             "evidence_policy": "validation logs contain complete redacted output",
         }
@@ -3778,7 +3872,10 @@ def _command_run_locked(args: argparse.Namespace) -> int:
         project_snapshot: dict[str, Any],
     ) -> str:
         validation_capsule = capsule(
-            label, validations, project_snapshot=project_snapshot
+            label,
+            validations,
+            review=latest_review,
+            project_snapshot=project_snapshot,
         )
         try:
             return render_prompt(

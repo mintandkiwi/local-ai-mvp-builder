@@ -909,6 +909,60 @@ class OrchestratorTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.WorkflowError, "SHA-256"):
                 MODULE.verify_context_capsule(path)
 
+    def test_supervisor_capsule_uses_plan_paths_and_future_validations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            run_dir = root / "run"
+            (project / "src" / "shared").mkdir(parents=True)
+            run_dir.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+            existing = project / "src" / "shared" / "existing.ts"
+            existing.write_text("export {}\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=project, check=True)
+            subprocess.run(
+                [
+                    "git", "-c", "user.name=Test", "-c",
+                    "user.email=test@example.com", "commit", "-qm", "base",
+                ],
+                cwd=project,
+                check=True,
+            )
+            plan = run_dir / "plan.md"
+            plan.write_text(
+                "Risk classification: high\n"
+                "Modify `src/shared/`, `src/background/service-worker.ts`, "
+                "and `package.json`. Validate with `npm run package:release`.\n",
+                encoding="utf-8",
+            )
+            log = run_dir / "baseline.log"
+            log.write_text("ok\n", encoding="utf-8")
+            capsule, _ = MODULE.write_context_capsule(
+                project,
+                run_dir,
+                stage="supervisor",
+                plan_path=plan,
+                risk={"classification": "high", "declared": True},
+                validations=[{"command": "test", "exit_code": 0, "log": str(log)}],
+            )
+            payload = json.loads(capsule.read_text(encoding="utf-8"))
+            scope = json.loads(
+                Path(payload["scope_evidence_path"]).read_text(encoding="utf-8")
+            )
+            validation = json.loads(
+                Path(payload["validation_evidence_path"]).read_text(encoding="utf-8")
+            )
+        self.assertEqual(scope["validation_phase"], "pre_implementation_baseline")
+        self.assertIn("src/shared/", scope["allowed_files"])
+        self.assertIn("src/shared/existing.ts", scope["allowed_files"])
+        self.assertIn("src/background/service-worker.ts", scope["allowed_files"])
+        self.assertIn("package.json", scope["allowed_files"])
+        self.assertIn("npm run package:release", scope["planned_post_edit_commands"])
+        self.assertEqual(validation["validation_phase"], "pre_implementation_baseline")
+        self.assertIn(
+            "npm run package:release", validation["planned_post_edit_commands"]
+        )
+
     def test_review_evidence_preserves_tail_after_sensitive_inline_example(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -4037,6 +4091,13 @@ class OrchestratorTests(unittest.TestCase):
             baseline_hash_matches = baseline_artifact["log_sha256"] == (
                 MODULE.file_sha256(Path(baseline_artifact["log_path"]))
             )
+            final_capsule = json.loads(
+                (project / "context-final-review.json").read_text(encoding="utf-8")
+            )
+            final_review_hash_matches = MODULE.file_matches_sha256(
+                Path(final_capsule["review_evidence_path"]),
+                final_capsule["review_evidence_sha256"],
+            )
         self.assertEqual(result, 0)
         ensure_model.assert_not_called()
         local.assert_not_called()
@@ -4052,6 +4113,8 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(preflight[1]["stage"], "baseline")
         self.assertEqual(baseline_artifact["command"], "test")
         self.assertTrue(baseline_hash_matches)
+        self.assertIsNotNone(final_capsule["review_evidence_path"])
+        self.assertTrue(final_review_hash_matches)
 
     def test_capsule_failure_does_not_count_or_start_cloud_review(self):
         passed_validation = [{"command": "test", "exit_code": 0}]
