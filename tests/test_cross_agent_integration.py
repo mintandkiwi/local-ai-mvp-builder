@@ -3,6 +3,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import importlib.util
 from pathlib import Path
@@ -92,6 +93,45 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(target.is_symlink())
         self.assertIn("未完成目标", result.stderr)
 
+    def test_conflict_with_legacy_backup_has_no_side_effects(self):
+        target = self.home / PLATFORM_PATHS[0]
+        target.mkdir(parents=True)
+        marker = target / "user-file.txt"
+        marker.write_text("keep me", encoding="utf-8")
+        legacy = target.with_name(f"{target.name}.backup.legacy")
+        legacy.mkdir()
+        legacy_marker = legacy / "SKILL.md"
+        legacy_marker.write_text("legacy", encoding="utf-8")
+
+        result = self.run_installer("--platforms", "codex")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "keep me")
+        self.assertEqual(legacy_marker.read_text(encoding="utf-8"), "legacy")
+        self.assertFalse(
+            (self.home / INSTALLER_MODULE.BACKUP_RELATIVE_ROOT).exists()
+        )
+
+    def test_all_targets_preflight_before_any_legacy_migration(self):
+        installed = self.run_installer("--platforms", "codex")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        codex = self.home / PLATFORM_PATHS[0]
+        legacy = codex.with_name(f"{codex.name}.backup.legacy")
+        legacy.mkdir()
+        legacy_marker = legacy / "SKILL.md"
+        legacy_marker.write_text("legacy", encoding="utf-8")
+        claude = self.home / PLATFORM_PATHS[1]
+        claude.mkdir(parents=True)
+        conflict_marker = claude / "user-file.txt"
+        conflict_marker.write_text("keep", encoding="utf-8")
+
+        result = self.run_installer("--platforms", "codex,claude")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(legacy_marker.read_text(encoding="utf-8"), "legacy")
+        self.assertEqual(conflict_marker.read_text(encoding="utf-8"), "keep")
+        self.assertIn("结果：完成 0", result.stderr)
+
     def test_force_creates_recoverable_backup_before_replacement(self):
         target = self.home / PLATFORM_PATHS[0]
         target.mkdir(parents=True)
@@ -101,13 +141,92 @@ class InstallerTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(target.is_symlink())
-        backups = list(target.parent.glob(f"{target.name}.backup.*"))
+        backups = list(
+            (
+                self.home
+                / INSTALLER_MODULE.BACKUP_RELATIVE_ROOT
+                / "codex"
+            ).iterdir()
+        )
         self.assertEqual(len(backups), 1)
         self.assertEqual(
             (backups[0] / "user-file.txt").read_text(encoding="utf-8"),
             "original",
         )
         self.assertIn("已备份", result.stdout)
+        self.assertEqual(
+            list(target.parent.glob(f"{target.name}.backup.*")), []
+        )
+
+    def test_existing_discoverable_backups_are_migrated_for_all_platforms(self):
+        first = self.run_installer()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        for index, relative in enumerate(PLATFORM_PATHS):
+            target = self.home / relative
+            legacy = target.with_name(f"{target.name}.backup.legacy-{index}")
+            legacy.mkdir()
+            (legacy / "SKILL.md").write_text(
+                "---\nname: local-ai-mvp-builder\n---\nstale\n",
+                encoding="utf-8",
+            )
+
+        migrated = self.run_installer()
+        self.assertEqual(migrated.returncode, 0, migrated.stderr)
+        self.assertIn("已迁移旧备份", migrated.stdout)
+        for relative in PLATFORM_PATHS:
+            target = self.home / relative
+            self.assertTrue(target.is_symlink())
+            self.assertEqual(
+                list(target.parent.glob(f"{target.name}.backup.*")), []
+            )
+        backup_root = self.home / INSTALLER_MODULE.BACKUP_RELATIVE_ROOT
+        stale_skills = list(backup_root.rglob("SKILL.md"))
+        self.assertEqual(len(stale_skills), len(PLATFORM_PATHS))
+
+    def test_partial_legacy_migration_failure_rolls_back_every_move(self):
+        target_path = self.home / PLATFORM_PATHS[0]
+        target_path.parent.mkdir(parents=True)
+        target_path.symlink_to(SKILL_SOURCE, target_is_directory=True)
+        legacy_paths = []
+        for suffix in ("one", "two"):
+            legacy = target_path.with_name(
+                f"{target_path.name}.backup.{suffix}"
+            )
+            legacy.mkdir()
+            (legacy / "SKILL.md").write_text(suffix, encoding="utf-8")
+            legacy_paths.append(legacy)
+        target = INSTALLER_MODULE.Target("codex", target_path, SKILL_SOURCE)
+        original_rename = INSTALLER_MODULE.Path.rename
+        legacy_attempts = 0
+
+        def fail_second_legacy(path, destination):
+            nonlocal legacy_attempts
+            if path in legacy_paths:
+                legacy_attempts += 1
+                if legacy_attempts == 2:
+                    raise OSError("injected migration failure")
+            return original_rename(path, destination)
+
+        with mock.patch.object(
+            INSTALLER_MODULE.Path, "rename", fail_second_legacy
+        ):
+            with self.assertRaisesRegex(
+                INSTALLER_MODULE.InstallError, "迁移失败且已回滚"
+            ):
+                INSTALLER_MODULE.install_target(
+                    target, self.home, dry_run=False, force=False
+                )
+
+        self.assertTrue(target_path.is_symlink())
+        for suffix, legacy in zip(("one", "two"), legacy_paths):
+            self.assertEqual(
+                (legacy / "SKILL.md").read_text(encoding="utf-8"), suffix
+            )
+        backup_root = self.home / INSTALLER_MODULE.BACKUP_RELATIVE_ROOT
+        self.assertEqual(
+            list(backup_root.rglob("SKILL.md")) if backup_root.exists() else [],
+            [],
+        )
 
     def test_failed_link_creation_restores_original_target(self):
         target_path = self.home / PLATFORM_PATHS[0]
@@ -117,6 +236,10 @@ class InstallerTests(unittest.TestCase):
         target = INSTALLER_MODULE.Target(
             "codex", target_path, SKILL_SOURCE
         )
+        legacy = target_path.with_name(f"{target_path.name}.backup.legacy")
+        legacy.mkdir()
+        legacy_marker = legacy / "SKILL.md"
+        legacy_marker.write_text("legacy", encoding="utf-8")
 
         with mock.patch.object(
             INSTALLER_MODULE.Path,
@@ -131,8 +254,10 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(target_path.is_dir())
         self.assertFalse(target_path.is_symlink())
         self.assertEqual(marker.read_text(encoding="utf-8"), "original")
+        self.assertEqual(legacy_marker.read_text(encoding="utf-8"), "legacy")
         self.assertEqual(
-            list(target_path.parent.glob(f"{target_path.name}.backup.*")), []
+            list(target_path.parent.glob(f"{target_path.name}.backup.*")),
+            [legacy],
         )
 
     def test_symlinked_parent_is_rejected(self):
@@ -165,14 +290,36 @@ class SupervisedLauncherTests(unittest.TestCase):
         self.mock_bin = self.root / "mock-bin"
         self.mock_bin.mkdir()
         self.invocation_log = self.root / "python-invocations.log"
+        mock_runner = self.root / "mock-orchestrator-runner.py"
+        mock_runner.write_text(
+            "import os, sys, time\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[1]))\n"
+            "import src.mvp_orchestrator as m\n"
+            "args = sys.argv[2:]\n"
+            "project = Path(args[args.index('--project') + 1]).resolve()\n"
+            "descriptor = None\n"
+            "try:\n"
+            "    descriptor, _ = m.acquire_project_run_lock(project)\n"
+            "    m.validate_project(project, True)\n"
+            "    commands = m.load_validation_commands(project)\n"
+            "    if not commands: raise m.WorkflowError('.mvp-ai.toml 必须配置 validation.commands')\n"
+            "    ready = os.environ.get('MVP_TEST_LOCK_READY')\n"
+            "    if ready: Path(ready).write_text('locked', encoding='utf-8')\n"
+            "    with Path(os.environ['MVP_TEST_LOG']).open('a', encoding='utf-8') as h:\n"
+            "        h.write(' '.join(sys.argv[1:]) + '\\n')\n"
+            "    time.sleep(float(os.environ.get('MVP_TEST_LOCK_HOLD', '0')))\n"
+            "except m.WorkflowError as exc:\n"
+            "    print(f'错误：{exc}', file=sys.stderr)\n"
+            "    raise SystemExit(1)\n"
+            "finally:\n"
+            "    if descriptor is not None: m.release_project_run_lock(descriptor)\n",
+            encoding="utf-8",
+        )
         mock_python = self.mock_bin / "python3"
         mock_python.write_text(
             "#!/bin/sh\n"
-            "case \" $* \" in\n"
-            "  *\" check-config \"*) exec \"$MVP_TEST_REAL_PYTHON\" \"$@\" ;;\n"
-            "esac\n"
-            "printf '%s\\n' \"$*\" >> \"$MVP_TEST_LOG\"\n"
-            "exit 0\n",
+            "exec \"$MVP_TEST_REAL_PYTHON\" \"$MVP_TEST_RUNNER\" \"$@\"\n",
             encoding="utf-8",
         )
         mock_python.chmod(0o755)
@@ -182,6 +329,8 @@ class SupervisedLauncherTests(unittest.TestCase):
         self.env["MVP_TEST_REAL_PYTHON"] = os.environ.get(
             "MVP_TEST_REAL_PYTHON", sys.executable
         )
+        self.env["MVP_TEST_RUNNER"] = str(mock_runner)
+        self.env["LOCAL_AI_MVP_STATE_DIR"] = str(self.root / "state")
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -257,11 +406,10 @@ class SupervisedLauncherTests(unittest.TestCase):
         )
         self.assertEqual(summary.returncode, 0, summary.stderr)
         lines = self.invocation_lines()
-        self.assertEqual(len(lines), 2)
-        self.assertTrue(lines[0].endswith("src/mvp_orchestrator.py doctor"))
-        self.assertIn("src/mvp_orchestrator.py run --project", lines[1])
-        self.assertIn(f"--plan {self.plan.resolve()}", lines[1])
-        self.assertNotIn("--live", lines[1])
+        self.assertEqual(len(lines), 1)
+        self.assertIn("src/mvp_orchestrator.py run --project", lines[0])
+        self.assertIn(f"--plan {self.plan.resolve()}", lines[0])
+        self.assertNotIn("--live", lines[0])
 
         self.invocation_log.unlink()
         live = self.run_launcher(
@@ -275,7 +423,35 @@ class SupervisedLauncherTests(unittest.TestCase):
             "live",
         )
         self.assertEqual(live.returncode, 0, live.stderr)
-        self.assertIn("--model secondary --live", self.invocation_lines()[1])
+        self.assertIn("--model secondary --live", self.invocation_lines()[0])
+
+    def test_two_official_launchers_lock_before_first_project_snapshot(self):
+        ready = self.root / "lock-ready"
+        first_env = dict(self.env, MVP_TEST_LOCK_READY=str(ready), MVP_TEST_LOCK_HOLD="1")
+        command = [
+            str(LAUNCHER), "--project", str(self.project),
+            "--plan", str(self.plan),
+        ]
+        first = subprocess.Popen(
+            command, cwd=self.root, env=first_env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            for _ in range(100):
+                if ready.is_file():
+                    break
+                time.sleep(0.01)
+            self.assertTrue(ready.is_file(), "first launcher never acquired project lock")
+            second = subprocess.run(
+                command, cwd=self.root, env=self.env, text=True,
+                capture_output=True, check=False,
+            )
+            self.assertEqual(second.returncode, 1)
+            self.assertIn("已有 Local AI MVP Builder 运行中", second.stderr)
+        finally:
+            first_stdout, first_stderr = first.communicate(timeout=5)
+        self.assertEqual(first.returncode, 0, first_stderr or first_stdout)
+        self.assertEqual(len(self.invocation_lines()), 1)
 
     def test_untracked_file_triggers_dirty_worktree_gate(self):
         (self.project / "untracked.txt").write_text("dirty", encoding="utf-8")
@@ -302,7 +478,7 @@ class SupervisedLauncherTests(unittest.TestCase):
             "--project", str(no_config), "--plan", str(self.plan)
         )
         self.assertEqual(missing_config.returncode, 1)
-        self.assertIn("缺少 .mvp-ai.toml", missing_config.stderr)
+        self.assertIn("validation.commands", missing_config.stderr)
         self.assertFalse(self.invocation_log.exists())
 
     def test_blank_validation_command_fails_before_doctor(self):
@@ -385,14 +561,15 @@ class SharedSkillTests(unittest.TestCase):
         self.assertTrue((SKILL_SOURCE / "agents/openai.yaml").is_file())
         self.assertTrue((SKILL_SOURCE / "references/plan-format.md").is_file())
         self.assertTrue((SKILL_SOURCE / "references/project-docs.md").is_file())
+        self.assertTrue((SKILL_SOURCE / "references/evidence-contract.md").is_file())
         self.assertIn(
             "${MVP_LOOP_PLAN_DIR:-$HOME/.local/share/local-ai-mvp-builder/plans}",
             skill,
         )
         self.assertNotIn("CODEX_HOME", skill)
         self.assertNotIn("active Codex takeover agent", skill)
-        self.assertIn("Do not let the current frontend edit the project", skill)
-        self.assertIn("resume the failed run from Codex", skill)
+        self.assertIn("Baseline/environment failure stops with zero model calls", skill)
+        self.assertIn("must remain `no_baseline`", skill)
         self.assertFalse(any(SKILL_SOURCE.rglob("*.bak")))
 
     def test_new_shell_entries_parse_and_files_have_no_trailing_space(self):

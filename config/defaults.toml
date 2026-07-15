@@ -1,10 +1,13 @@
 [workflow]
 max_local_review_rounds = 2
+strategy = "adaptive"
+severe_finding_threshold = 5
 coder_timeout_seconds = 3600
 local_stall_timeout_seconds = 300
 review_timeout_seconds = 1800
 supervisor_timeout_seconds = 3600
 require_clean_worktree = true
+context_capsule_max_bytes = 16384
 auto_commit = false
 auto_push = false
 
@@ -16,3 +19,7 @@ ollama_host = "http://127.0.0.1:11434"
 provider = "openai"
 model = "gpt-5.6-sol"
 reasoning_effort = "high"
+max_calls_per_run = 4
+# high/未知风险至少需要 2；low/medium 至少需要 3。编排器始终为 supervisor 后的 final review 预留 1 次。
+# 可设为正整数；0 表示不配置云端 Token 软预算。预算只告警，不会中断安全修复。
+soft_token_budget = 0

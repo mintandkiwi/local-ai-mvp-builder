@@ -17,7 +17,7 @@ usage() {
   cat <<'EOF'
 用法：mvp-loop-supervised --project PATH --plan FILE [选项]
 
-运行本地 Qwen coding + Codex review 的受监督 MVP 工作流。
+运行带前置基线、风险路由、Token 计量和自适应 review 的受监督 MVP 工作流。
 
 必需参数：
   --project PATH           目标 Git 项目目录
@@ -28,7 +28,10 @@ usage() {
   --display summary|live     输出模式（默认：summary）
   -h, --help                 显示帮助
 
-该入口固定拒绝脏工作区，且不接受 --allow-dirty。
+该入口固定拒绝脏工作区，且不接受 --allow-dirty。计划必须声明
+Risk classification: low|medium|high；未声明按 high 直接云端监督处理。
+模型修改前会在可丢弃副本中运行可写干净基线；失败时 local/cloud 调用数均为 0。
+用量、接管原因、预算状态和 no_baseline 证据写入 summary.json。
 EOF
 }
 
@@ -94,34 +97,12 @@ if [ ! -d "$PROJECT" ]; then
   exit 1
 fi
 PROJECT=$(CDPATH= cd -- "$PROJECT" && pwd -P)
-if ! git -C "$PROJECT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  echo "错误：目标不是 Git 仓库：$PROJECT" >&2
-  exit 1
-fi
-if [ -n "$(git -C "$PROJECT" status --porcelain)" ]; then
-  echo "错误：目标仓库不是干净状态，请先提交或暂存到仓库外；未跟踪文件也会触发此门禁。" >&2
-  exit 1
-fi
-if [ ! -f "$PROJECT/.mvp-ai.toml" ]; then
-  echo "错误：目标项目缺少 .mvp-ai.toml：$PROJECT/.mvp-ai.toml" >&2
-  exit 1
-fi
 if [ ! -f "$PLAN" ]; then
   echo "错误：计划文件不存在：$PLAN" >&2
   exit 1
 fi
 PLAN_DIR=$(CDPATH= cd -- "$(dirname -- "$PLAN")" && pwd -P)
 PLAN=$PLAN_DIR/$(basename -- "$PLAN")
-
-if ! python3 "$REPO_ROOT/src/mvp_orchestrator.py" check-config --project "$PROJECT"; then
-  echo "错误：项目验证配置无效，请在 .mvp-ai.toml 中填写至少一条非空真实命令。" >&2
-  exit 1
-fi
-
-if ! python3 "$REPO_ROOT/src/mvp_orchestrator.py" doctor; then
-  echo "错误：环境检查失败，请根据 doctor 输出安装或启动缺失依赖。" >&2
-  exit 1
-fi
 
 if [ "$DISPLAY" = live ]; then
   exec python3 "$REPO_ROOT/src/mvp_orchestrator.py" run \

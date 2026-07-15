@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SKILL_SOURCE = ROOT / "integrations" / "skills" / "local-ai-mvp-builder"
 LAUNCHER_SOURCE = ROOT / "bin" / "mvp-loop-supervised"
+BACKUP_RELATIVE_ROOT = Path(".local/share/local-ai-mvp-builder/backups")
 
 PLATFORM_PATHS = {
     "codex": Path(".codex/skills/local-ai-mvp-builder"),
@@ -116,16 +117,76 @@ def same_link(path: Path, source: Path) -> bool:
         return False
 
 
-def backup_path(target: Path) -> Path:
+def backup_path(target: Target, home: Path) -> Path:
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    candidate = target.with_name(f"{target.name}.backup.{stamp}")
+    label = target.name.lower().replace(" ", "-")
+    directory = home / BACKUP_RELATIVE_ROOT / label
+    candidate = directory / stamp
     counter = 1
     while path_exists(candidate):
-        candidate = target.with_name(
-            f"{target.name}.backup.{stamp}.{counter}"
-        )
+        candidate = directory / f"{stamp}.{counter}"
         counter += 1
     return candidate
+
+
+def migrate_legacy_backups(
+    target: Target, home: Path, *, dry_run: bool
+) -> tuple[list[str], list[tuple[Path, Path]]]:
+    """Move old sibling backups out of every frontend Skill discovery tree."""
+    messages: list[str] = []
+    moved: list[tuple[Path, Path]] = []
+    legacy_paths = sorted(
+        target.path.parent.glob(f"{target.path.name}.backup.*")
+    )
+    for legacy in legacy_paths:
+        destination = backup_path(target, home)
+        ensure_safe_parent(home, destination.parent, dry_run=dry_run)
+        if dry_run:
+            messages.append(f"计划迁移旧备份：{legacy} -> {destination}")
+            continue
+        try:
+            legacy.rename(destination)
+            moved.append((legacy, destination))
+            if path_exists(legacy) or not path_exists(destination):
+                raise InstallError(f"无法验证旧备份迁移：{legacy}")
+        except Exception as exc:
+            rollback_migrations(moved)
+            raise InstallError(f"旧备份迁移失败且已回滚：{legacy}") from exc
+        messages.append(f"已迁移旧备份：{legacy} -> {destination}")
+    return messages, moved
+
+
+def rollback_migrations(moved: list[tuple[Path, Path]]) -> None:
+    failures: list[str] = []
+    for legacy, destination in reversed(moved):
+        try:
+            if path_exists(destination) and not path_exists(legacy):
+                destination.rename(legacy)
+            if path_exists(destination) or not path_exists(legacy):
+                failures.append(f"{destination} -> {legacy}")
+        except OSError:
+            failures.append(f"{destination} -> {legacy}")
+    if failures:
+        raise InstallError("无法回滚旧备份迁移：" + ", ".join(failures))
+
+
+def preflight_target(target: Target, home: Path, *, force: bool) -> None:
+    source = target.source.resolve(strict=True)
+    ensure_safe_parent(home, target.path.parent, dry_run=True)
+    existing = path_exists(target.path)
+    current = same_link(target.path, source)
+    if existing and not current and not force:
+        raise InstallError(
+            f"目标已存在且不是当前共享链接：{target.path}；"
+            "请检查内容后显式使用 --force"
+        )
+    has_legacy = any(
+        target.path.parent.glob(f"{target.path.name}.backup.*")
+    )
+    if has_legacy or (existing and not current):
+        ensure_safe_parent(
+            home, backup_path(target, home).parent, dry_run=True
+        )
 
 
 def install_target(
@@ -133,53 +194,76 @@ def install_target(
 ) -> str:
     source = target.source.resolve(strict=True)
     ensure_safe_parent(home, target.path.parent, dry_run=dry_run)
-
-    if same_link(target.path, source):
-        return f"已是最新：{target.name} -> {source}"
-
+    current = same_link(target.path, source)
     existing = path_exists(target.path)
     backup: Path | None = None
-    if existing and not force:
+    if existing and not current and not force:
         raise InstallError(
             f"目标已存在且不是当前共享链接：{target.path}；"
             "请检查内容后显式使用 --force"
         )
-    if existing:
-        backup = backup_path(target.path)
+    if existing and not current:
+        backup = backup_path(target, home)
+        ensure_safe_parent(home, backup.parent, dry_run=dry_run)
+    messages, moved = migrate_legacy_backups(
+        target, home, dry_run=dry_run
+    )
+
+    if current:
+        messages.append(f"已是最新：{target.name} -> {source}")
+        return "\n".join(messages)
 
     if dry_run:
         if backup is not None:
-            return (
+            messages.append(
                 f"计划备份：{target.path} -> {backup}\n"
                 f"计划安装：{target.name} -> {source}"
             )
-        return f"计划安装：{target.name} -> {source}"
-
-    if backup is not None:
-        target.path.rename(backup)
-        if path_exists(target.path) or not path_exists(backup):
-            raise InstallError(f"无法验证备份：{backup}")
+            return "\n".join(messages)
+        messages.append(f"计划安装：{target.name} -> {source}")
+        return "\n".join(messages)
 
     try:
+        if backup is not None:
+            target.path.rename(backup)
+            if path_exists(target.path) or not path_exists(backup):
+                raise InstallError(f"无法验证备份：{backup}")
         target.path.symlink_to(source, target_is_directory=source.is_dir())
         if not same_link(target.path, source):
             raise InstallError(f"安装后链接校验失败：{target.path}")
-    except Exception:
-        if path_exists(target.path):
-            if target.path.is_dir() and not target.path.is_symlink():
-                shutil.rmtree(target.path)
-            else:
-                target.path.unlink()
-        if backup is not None and path_exists(backup):
-            backup.rename(target.path)
+    except Exception as exc:
+        recovery_failures: list[str] = []
+        try:
+            if path_exists(target.path):
+                if target.path.is_dir() and not target.path.is_symlink():
+                    shutil.rmtree(target.path)
+                else:
+                    target.path.unlink()
+        except OSError as recovery_error:
+            recovery_failures.append(f"清理失败目标：{recovery_error}")
+        try:
+            if backup is not None and path_exists(backup):
+                backup.rename(target.path)
+        except OSError as recovery_error:
+            recovery_failures.append(f"恢复原目标：{recovery_error}")
+        try:
+            rollback_migrations(moved)
+        except InstallError as rollback_error:
+            recovery_failures.append(str(rollback_error))
+        if recovery_failures:
+            raise InstallError(
+                "安装失败且恢复不完整：" + "; ".join(recovery_failures)
+            ) from exc
         raise
 
     if backup is not None:
-        return (
+        messages.append(
             f"已备份：{backup}\n"
             f"已安装：{target.name} -> {source}"
         )
-    return f"已安装：{target.name} -> {source}"
+        return "\n".join(messages)
+    messages.append(f"已安装：{target.name} -> {source}")
+    return "\n".join(messages)
 
 
 def targets_for(home: Path, platforms: list[str]) -> list[Target]:
@@ -217,9 +301,22 @@ def main(argv: list[str] | None = None) -> int:
         print("错误：仓库安装源不完整：" + ", ".join(map(str, missing)), file=sys.stderr)
         return 2
 
+    selected_targets = targets_for(home, args.platforms)
     failures: list[str] = []
+    for target in selected_targets:
+        try:
+            preflight_target(target, home, force=args.force)
+        except (InstallError, OSError) as exc:
+            failures.append(f"{target.name}: {exc}")
+    if failures:
+        print("未完成目标：", file=sys.stderr)
+        for failure in failures:
+            print(f"- {failure}", file=sys.stderr)
+        print(f"结果：完成 0，失败 {len(failures)}", file=sys.stderr)
+        return 1
+
     completed: list[str] = []
-    for target in targets_for(home, args.platforms):
+    for target in selected_targets:
         try:
             completed.append(
                 install_target(

@@ -2,54 +2,47 @@
 
 ## 项目目标
 
-提供可版本管理、可公开发布且与前端 Agent 无关的受监督本地 AI 开发工作流。Codex、Claude Code、Antigravity IDE 和 Antigravity CLI 共用仓库内唯一 Skill；本地 Qwen 承担编码，云端 Codex 承担结构化评审、异常接管和最终确认。
+提供跨 Codex、Claude Code、Antigravity IDE 和 Antigravity CLI 的受监督本地 AI MVP 工作流。在不降低测试、安全、数据保护和独立终审门槛的前提下，按风险分配本地 Qwen 与云端 Codex 的职责，记录每次 agent 调用的 Token 证据，并在环境失败或严重 finding 出现时提前止损。
 
 ## 技术栈
 
-- Python 3.11+：核心编排、安全安装、Ollama 检查、结构化 Review 和运行摘要。
-- POSIX shell：`mvp-loop`、`mvp-loop-supervised`、安装器与模型下载入口。
-- Ollama：运行 `qwen3-coder:30b` 和备选 `qwen3.6:35b`。
-- Codex CLI：通过 Ollama provider 驱动本地 coder，通过 OpenAI provider 驱动 reviewer/supervisor。
-- Git：干净基线、完整工作区状态、diff 和版本快照。
-- macOS Seatbelt：隔离项目验证命令的网络、Git 元数据和敏感文件访问。
-- Agent Skills 公共子集：首行 YAML `name`/`description` 与 Markdown 工作流说明。
+- Python 3.11+：编排器、Token 解析、风险/Review 决策、上下文 capsule、summary 和安全安装器。
+- POSIX shell、TOML：统一监督入口与默认策略配置。
+- Ollama：本地 `qwen3-coder:30b` 与备选 `qwen3.6:35b`。
+- Codex CLI：Ollama provider 驱动本地 coder/fixer，OpenAI provider 驱动只读 reviewer 和可写 supervisor。
+- Git、macOS Seatbelt：干净基线、diff 导航和无网络/无 Git 元数据写入的验证隔离。
 
 ## 架构与关键路径
 
-1. 四种前端从各自用户级 Skills 目录发现 `local-ai-mvp-builder`；这些目录都软链接到仓库的唯一 Skill 源。
-2. Skill 只调用 PATH 中的 `mvp-loop-supervised`，计划默认位于 `${MVP_LOOP_PLAN_DIR:-$HOME/.local/share/local-ai-mvp-builder/plans}`。
-3. 监督入口解析受控参数，针对 `--project` 验证 Git、tracked/staged/untracked 干净状态、计划和 `.mvp-ai.toml`，再运行 doctor。
-4. 入口调用 `mvp_orchestrator.py run`；本地 Qwen 修改目标项目、测试和三份中文文档。
-5. Seatbelt 中执行项目验证与文档契约，随后云端 Codex Review 全部未提交 diff。
-6. 首次失败交回 Qwen 修复；第二次失败或本地执行异常由云端 Codex 接管，再执行验证和独立最终 Review。
-7. 通过后 `summary.json` 标记 `ready_for_user_review`；Git commit、push、tag、release 或 PR 必须另获用户授权。
+1. 四种前端发现仓库内唯一 `local-ai-mvp-builder` Skill，并通过 PATH 调用 `mvp-loop-supervised`。
+2. 启动器只解析参数并规范化项目/计划路径，然后直接进入编排器唯一 `run` 入口；不在锁外读取 Git clean 状态、项目配置或执行 doctor。
+3. 第一次 clean/配置检查前，编排器在 workspace 外获取跨前端项目锁；随后检查 `sandbox-exec`、reviewer 版本与结构化输出能力、schema/仓库/diff 可读性和本地模型（仅 local-first），并把成功或失败的结构化宿主探针写入 summary。它创建排除 `.envrc`、任意层级 `.direnv`、任意层级 `.docker/config.json` 及其他已知敏感路径的私有可丢弃副本；普通 `.docker` 目录和 Dockerfile 会保留并参与验证。验证专用 HOME/cache/tmp/bin 位于另一随机临时目录，Seatbelt 对同一类敏感路径拒绝读写，并拒绝网络和证据目录，但允许在副本中生成与正式验证等价的构建产物。写探针和干净基线结束后以两阶段清理恢复嵌套目录权限/flags 并确认副本不存在，再在首个模型调用前重新核对 HEAD、完整 porcelain、配置哈希及稳定加载的验证命令。环境、基线、并发变化或清理失败均以零 local/cloud 调用停止，真实目标和用户文件保持不变。
+4. `low`/`medium` 进入 local-first；`high` 或未声明风险直接进入 cloud supervisor。编码后验证失败只允许一次精简的本地验证修复，验证通过后才进入 review。
+5. 风险只从非代码块正文中恰好一条完整声明读取，且不得并存其他可见 risk-like 控制行；占位、重复、冲突、有效与无效混合、fenced-only 均按 high。Review finding 具有 schema 强制的类别；P0/P1 以及任何 severity 的 security/data_loss/reliability/other 立即接管，只有明确的 correctness/documentation/performance/testing P2 才允许一次 fixer，同类别 P3-only 才非阻塞。supervisor 前预留其自身与 final review 两次云端容量。
+6. 接管后重新运行项目验证和中文文档门禁；验证通过才由独立 reviewer 终审，失败则停止并省去无效终审调用。只有验证与终审全部通过才写 `ready_for_user_review`。
+7. 每次 agent 调用都在成功、失败和超时路径生成唯一 `usage.stages` 记录。持久化先解析完整 JSON/逐行 JSONL 并递归清除敏感子树，再做纯文本兜底，因此数值 JSON usage 保持 exact；文本总数为 partial，缺失为 unavailable/null。summary 同时汇总 cloud 下限、调用数、接管原因、验证/finding 统计、风险、capsule 和预算状态。
+8. 运行记录位于 workspace 外的私有状态目录，宿主证据拒绝符号链接并原子写入；批准计划的源路径、初始 SHA-256 和外部副本在 agent/capsule/summary 边界反复核对。capsule 从 `git status --porcelain=v1 -z` 获取 changed files，并绑定 staged/unstaged diff 与全部 untracked 内容的加密快照；normal、compact 和最终降级均携带内容快照及 plan/scope/validation/review 哈希。验证后源码漂移、reviewer 前后快照变化或任一证据不一致立即阻塞。
 
 ## 重要文件
 
-- `integrations/skills/local-ai-mvp-builder/SKILL.md`：唯一权威 Skill 工作流与触发描述。
-- `integrations/skills/local-ai-mvp-builder/references/`：批准计划格式和中文项目文档契约。
-- `integrations/skills/local-ai-mvp-builder/agents/openai.yaml`：可忽略的 Codex UI 元数据。
-- `bin/mvp-loop-supervised`：Agent 无关的受监督 PATH 入口，不提供脏工作区绕过。
-- `bin/install-agent-skills`：安全安装器 Shell 入口。
-- `src/agent_skill_installer.py`：平台映射、冲突保护、备份、回滚和软链接部署逻辑。
-- `src/mvp_orchestrator.py`：两轮闭环、看门狗、验证、Review、接管与版本快照。
-- `config/`、`prompts/`、`schemas/`、`templates/`：模型、运行、提示词、结构化输出和项目初始化契约。
-- `tests/test_cross_agent_integration.py`：真实安装器、启动器和 Skill 包回归测试。
-- `tests/test_orchestrator.py`：原有安全、接管、文档和编排回归测试。
-- `README.md`、`LICENSE`：公开安装/回滚说明与 MIT 许可。
+- `src/mvp_orchestrator.py`：前置门禁、agent 调用、Token 解析、风险/自适应路由、capsule、验证和 summary 契约。
+- `config/defaults.toml`：adaptive/legacy、严重 finding 阈值、capsule 大小、云端软预算和最大调用数。
+- `prompts/`：本地文件职责边界与按需读取 capsule 的 coder/fixer/reviewer/supervisor 提示词。
+- `integrations/skills/local-ai-mvp-builder/`：唯一 Skill 维护源；`references/evidence-contract.md` 解释用量和效率证据。
+- `bin/mvp-loop-supervised`：无脏工作区绕过的统一入口和用户帮助。
+- `tests/test_orchestrator.py`：Token、summary、预检、风险、自适应路由、watchdog、capsule 和安全回归。
+- `tests/test_cross_agent_integration.py`：Skill 包、启动器和四平台安装回归。
+- `README.md`、`README_EN.md`：面向用户的中英文安装、运行、安全和恢复说明，并提供双向语言切换。
 
 ## 约束
 
-- 仓库内 Skill 是唯一维护源；不得复制个人 Agent 配置或形成第二份仓库 Skill。
-- 目标项目必须是干净 Git 工作区，未跟踪文件同样阻止启动；监督入口拒绝 `--allow-dirty`。
-- `.mvp-ai.toml` 至少包含一条真实验证命令，两轮本地 Review 失败阈值固定。
-- Claude Code 和 Antigravity 目前只是入口，不能被描述为 reviewer/supervisor 后端。
-- 安装器只写当前用户已知目录；普通冲突默认拒绝，显式替换必须先生成可恢复备份。
-- 不读取或提交凭据、认证配置、模型权重、`runs/`、真实 token、私有远程地址或个人绝对路径。
-- 不自动 commit、push、切分支、改写历史、发布 release 或创建 PR。
+- 默认不自动 commit、push、切换分支、改写历史、发布或创建 PR；本次 GitHub 发布只在用户明确授权的当前分支和变更范围内执行，本轮不执行真实云端 A/B。
+- 现有 P0–P2 阻塞标准、项目验证、中文三文档和接管后的独立终审不得降低。
+- Token 未知不能记为 0；partial/unavailable 不能称为完整，计量不完整时不能宣称在预算内。
+- 单次运行默认 `efficiency.claim = no_baseline`；没有另行批准且完整计量的等价 direct-Codex 对照，不得宣称节省或换算费用。
+- summary、capsule、live 输出、命令/验证日志、review JSON 和 last-message 不保存未脱敏的凭据、私钥、环境文件内容或私有 remote URL；结构化 JSON key 同样执行递归脱敏。live 只呈现工具/文件事件、模型提供的推理摘要、Token 和顶层失败摘要，不呈现原始私有思维链。
+- 仓库 integration 是 Skill 唯一维护源，个人目录只保留安装链接。
 
 ## 当前状态
 
-跨 Agent Skill 唯一源、安全监督启动器、四平台幂等安装器、真实回归测试、公开 README 和 MIT License 均已实现。自动运行最终状态 `needs_manual_attention` 作为历史证据保留；其遗留 finding 已由人工接管修复，原生环境 44 项测试全部通过，受监督验证沙箱 44 项通过、2 项因父级 Seatbelt 限制精确跳过，Python 编译、Shell 语法、中文文档门禁和新的独立 Review 均已通过。
-
-方案 B 已实际安装：Codex、Claude Code、Antigravity IDE 和 Antigravity CLI 的用户级 Skill 目录均软链接到仓库唯一源，`~/.local/bin/mvp-loop-supervised` 可正常显示帮助；旧 Codex Skill 已保留时间戳备份。公开 GitHub 仓库 `https://github.com/mintandkiwi/local-ai-mvp-builder` 已创建，`main` 基线与 `agent/cross-agent-skill` 功能分支均已推送，Draft PR #1 位于 `https://github.com/mintandkiwi/local-ai-mvp-builder/pull/1`，等待用户最终评审。
+TE-001 至 TE-009 模拟验收已落盘。独立 `review-4` 至 `review-35` 共报告 25 个 P1、77 个 P2；`review-15`、`review-26` 因 usage limit 无 verdict，其余 finding 均已针对性修复，原生回归由 68 项增至 143 项并全部通过。`review-36` 核验 12 项门禁、完整证据哈希和冻结快照后返回 `pass`、0 finding，外部 summary 状态为 `ready_for_user_review`。当前 discoverable Skill backup 已迁出。最终实现完全排除基线原 `.git`；允许的原 HEAD blob 形成无父合成 HEAD，当前 index blob 形成合成 index，真实工作树保留 staged/unstaged/untracked 与 diff-check 语义。验证前预存根/嵌套 `.git` 全部封锁，普通根项目路径走私有 `GIT_DIR`，严格子路径 `init/clone` 和验证中新建子仓库按自身目录发现。安装器在任何迁移前预检全部目标，并对迁移中途或后续安装失败执行事务回滚。中英文 README 已完成并互相链接；当前进入用户授权的 GitHub 发布阶段。TE-010 未获真实 A/B Token 预算授权，不能称“Token 节省已验证”。

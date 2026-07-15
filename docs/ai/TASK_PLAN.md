@@ -2,43 +2,43 @@
 
 ## 当前里程碑
 
-里程碑 M3 已完成：Local AI MVP Builder 已实现跨 Agent 开源部署，关闭自动运行遗留 finding，取得独立 Review 通过结论并发布 Draft PR。
+M4：Local AI MVP Builder Token 效率整改。目标是完成 TE-001 至 TE-009 的计量、前置止损、风险路由、自适应 review、上下文压缩和模拟验收；TE-010 真实 A/B 必须等待用户单独批准云端 Token 预算。
 
 ## 已完成
 
-- `M2-01` 至 `M2-08`：完成本地模型、两轮受监督编排、结构化 Review、看门狗、中文文档契约、安全版本快照和原有 29 项回归基线。
-- `M3-01`：建立 `integrations/skills/local-ai-mvp-builder/` 唯一 Skill 源，删除备份副本和个人目录维护依赖。
-- `M3-02`：加入公共 Agent Skills frontmatter、Agent 无关计划目录、固定门禁、参考文档和 Codex UI 元数据。
-- `M3-03`：实现可从任意 cwd 和软链接启动的 `mvp-loop-supervised`，正确映射 summary/live 并拒绝脏工作区绕过。
-- `M3-04`：实现 Codex、Claude Code、Antigravity IDE、Antigravity CLI 四平台路径映射和 `~/.local/bin` 入口。
-- `M3-05`：实现安装 dry-run、幂等升级、普通冲突拒绝、`--force` 原子备份、失败回滚、软链接父目录保护和部分失败汇总。
-- `M3-06`：用临时 HOME 与临时 Git 项目直接测试真实入口，覆盖四平台、冲突、备份、软链接、参数映射、缺失文件和 untracked 门禁。
-- `M3-07`：更新 README 的依赖、安装、调用、升级、卸载、恢复、平台差异与 reviewer/supervisor 边界。
-- `M3-08`：增加署名为 Yancy Chan 的 MIT `LICENSE`，确认 `.gitignore` 继续排除 `runs/`、缓存和系统文件。
-- `M3-09`：更新当日中文日志、AI 项目大纲和任务规划。
-- `M3-10`：人工接管修复共享 Skill 非 Codex 接管边界，并在统一配置解析中拒绝空白验证命令。
-- `M3-11`：原生环境 44 项测试全部通过，Python 编译与四个 Shell 入口语法通过；故障注入覆盖安装失败后的原 Skill 恢复路径。
-- `M3-12`：受监督验证沙箱通过（44 项通过、2 项因父级 Seatbelt 精确跳过），人工修复后的独立 Review verdict 为 `pass`，没有新的 P0/P1/P2。
-- `M3-13`：将唯一 Skill 源安装到 Codex、Claude Code、Antigravity IDE 和 Antigravity CLI，核对四个平台文件与统一 PATH 入口；旧 Codex Skill 已生成可恢复备份。
-- `M3-14`：创建公开仓库 `mintandkiwi/local-ai-mvp-builder`，推送 `main` 与 `agent/cross-agent-skill`，创建 Draft PR #1。
+- `TE-001`：实现 JSON `turn.completed.usage` 与 `tokens used` 文本解析；重复完成事件不重复求和，大整数保真，缺失/损坏为 unavailable/null；成功、失败、超时入口统一生成阶段记录。
+- `TE-002`：在兼容旧字段基础上扩展 summary 的 `usage`、`workflow`、`risk`、`preflight`、`context_capsules` 和 `efficiency`；增加凭据脱敏与 no_baseline 安全回归。
+- `TE-003`：官方启动器在任何 Git/config/doctor 项目检查前进入编排器唯一加锁入口；第一次 clean 检查前获取 workspace 外的跨前端项目锁。在排除 `.envrc`、任意层级 `.direnv` 和 `.docker/config.json` 等已知敏感路径的私有可丢弃副本中，以正式 Seatbelt 和等价项目写权限运行干净基线；普通 `.docker` 目录/Dockerfile 保留。结束后两阶段清理嵌套权限/flags 并确认副本不存在，再在模型前复核 HEAD、完整 porcelain 和稳定配置快照；任一失败时真实目标与用户文件不变，agent 调用为 0。
+- `TE-004`：默认改为 adaptive，最多两轮 pre-takeover review；schema 强制 finding category，首次 P0/P1、安全/数据丢失/可靠性/未知类别或大量 finding 立即接管，只有明确的普通局部 P2 才允许一次 fixer；保留 legacy 回滚值。
+- `TE-005`：计划正文强制恰好一条完整 `Risk classification: low`/`medium`/`high` 声明；占位符、代码块示例、重复或冲突均按 high，high 关键实现 direct-cloud，local coder 仅处理 low/medium。
+- `TE-006`：生成可审计、去敏、UTF-8 安全、大小受限的 context capsule，提示词改为完整计划路径加 capsule/按需仓库读取。
+- `TE-007`：增加云端软 Token 预算、最大调用数、cloud lower bound 和保守预算状态；计量不完整不判定为预算内。
+- `TE-008`：更新唯一 Skill、plan/evidence reference、UI 元数据、README、CLI 帮助和中文 AI 文档。
+- `TE-009A`：新增模拟回归覆盖 Token JSON/文本/缺失/损坏/重复/大整数、summary 安全、基线零调用、low/medium/high 路由、首轮 P1、局部 P2、P3-only、watchdog、quoted/多行凭据、各类私钥、reviewer 能力预检和大 capsule 脱敏/截断。
+- `TE-009B`：独立 `review-4` 至 `review-35` 共发现 25 个 P1、77 个 P2（`review-15`、`review-26` 无 verdict）；全部有效 finding 已修复，原生回归由 68 项增至 143 项，并覆盖外置证据、内容快照、风险/类别策略、凭据脱敏、去敏 Git 视图、子仓库路由和事务安装。
+- `TE-009C`：`review-36` 核验 12 项门禁、完整证据哈希和冻结快照后返回 `pass`、0 finding；summary 已达到 `ready_for_user_review`。
 
 ## 进行中
 
-- 等待用户评审 Draft PR #1；未经新的明确授权不转为 Ready、不合并、不创建 tag/release。
+- `RELEASE-001`：根据用户明确授权，完成中英文 README、重跑发布前门禁，并将当前分支提交、推送后创建面向 `main` 的 Draft PR。
 
 ## 待办
 
-- `M4-01`：用首个真实 MVP 验证长任务接管、同日多次日志追加和发布闭环。
+- `TE-010`：待用户单独批准真实云端 Token 预算后，设计至少 3 组等价低/中风险 direct-Codex 与 local-first A/B；未批准前不得执行或宣称节省。
+- `M4-FOLLOWUP`：如 A/B 中位数云端 Token 未下降 25% 或成功/安全标准不等价，将 claim 记为 `regression`/`inconclusive` 并调整路由，不关闭优化验证。
 
 ## 验收标准
 
-- `SKILL.md` 首行是有效 YAML frontmatter，不含个人路径或前端专属计划目录，仓库中不存在第二 Skill 副本。
-- `mvp-loop-supervised --help` 可从任意 cwd 和软链接调用；正式执行验证目标项目、完整脏状态、计划、配置与 doctor。
-- 临时 HOME 中四平台安装、dry-run、幂等、冲突拒绝、force 备份和恢复证据可靠，测试不写真实用户配置。
-- 原有编排、安全、看门狗和文档回归继续有效，新增真实跨 Agent 测试通过。
-- README、MIT License、中文日志和 AI 文档与当前 diff 及验证证据一致。
-- 版本管理操作只按用户本轮明确授权执行；不创建 tag/release，不改写 Git 历史，功能变更先通过 Draft PR 交付。
+- 每个已启动 agent 阶段有唯一记录；未知 Token 为 null/unavailable，partial 不称完整。
+- 基线/环境预检失败时目标工作区保持干净，local/cloud agent 调用均为 0。
+- 首轮 P1 不发生第二次 pre-takeover review；局部 P2 通过路径最多两次 reviewer；接管后重新验证并独立终审。
+- high/未知风险不由本地 coder 独立实现关键代码。
+- capsule 有字节数、字段和截断元数据，不泄露凭据、私钥、原始提示或私有 remote。
+- `ready_for_user_review` 仍要求项目验证、中文三文档和独立 review 全部通过。
+- 全部项目测试、Python 编译、Shell 语法、Skill quick validation、CLI help 和 `git diff --check` 通过。
 
 ## 下一步
 
-用户评审 `https://github.com/mintandkiwi/local-ai-mvp-builder/pull/1`；通过后再决定合并和版本发布。首个真实 MVP 继续使用 `$local-ai-mvp-builder` 验证完整闭环。
+中英文 README 已完成；重新运行发布前门禁后，提交并推送 `agent/cross-agent-skill`，创建面向 `main` 的 Draft PR 供用户检查。TE-010 继续保持“待预算批准”，只有用户明确批准真实云端 Token 消耗后才创建等价 A/B 计划并执行。
+
+证据冻结说明：独立终审 capsule 必须在 tracked 文档停止修改后生成，因此仓库文档只记录上一轮已完成 verdict 与下一步；新一轮外部 capsule/终审结果将在冻结快照之后产生并写入权限受限的运行目录。这是内容快照不可变性约束，不应视为 tracked 状态遗漏。
