@@ -2,7 +2,7 @@
 
 [中文](README.md) | [English](README_EN.md)
 
-Local AI MVP Builder 用同一套仓库内 Agent Skill，把 Codex、Claude Code、Antigravity IDE 和 Antigravity CLI 接入受监督的 MVP 开发闭环。四种前端都只是工作流入口：Codex CLI 通过 Ollama provider 驱动本地 Qwen 编码，云端 Codex 仍负责结构化 Code Review、看门狗接管和最终确认。
+Local AI MVP Builder 用同一套仓库内 Agent Skill，把 Codex、Claude Code、Antigravity IDE 和 Antigravity CLI 接入受监督的 MVP 开发闭环。四种前端都只是工作流入口：Codex CLI 通过可配置的本地推理后端驱动 coding agent，云端 Codex 仍负责结构化 Code Review、看门狗接管和最终确认。
 
 流程不会自动 commit、push、切换分支、创建仓库或发布版本。最终改动保留在目标仓库中等待人工评审。
 
@@ -18,7 +18,7 @@ Codex / Claude Code / Antigravity IDE / Antigravity CLI
  doctor + clean Git + risk/plan/config + baseline gates
                          │
               src/mvp_orchestrator.py run
-                 ├─ local Qwen coder
+                 ├─ local coding agent
                  ├─ project validations
                  ├─ cloud Codex reviewer
                  └─ cloud Codex takeover supervisor
@@ -26,23 +26,20 @@ Codex / Claude Code / Antigravity IDE / Antigravity CLI
 
 仓库中的 `integrations/skills/local-ai-mvp-builder/` 是唯一维护源。安装器向各平台目录创建指向该目录的软链接，避免复制后的版本漂移；`~/.local/bin/mvp-loop-supervised` 同样指向仓库入口。
 
-## macOS 依赖
+## 运行依赖
 
 - Python 3.11 或更高版本（需要标准库 `tomllib`）
-- POSIX shell、Git 和 macOS `sandbox-exec`
-- [Ollama](https://ollama.com/) 与本地模型 `qwen3-coder:30b`；可选 `qwen3.6:35b`
-- 已登录且可使用 Ollama provider 与 OpenAI provider 的 Codex CLI
-- `aria2c`，用于并行拉取并校验模型文件
+- POSIX shell、Git，以及当前版本支持的系统隔离后端
+- 已安装并完成配置的本地推理后端与 coding-capable 模型
+- 已登录且可使用本地 provider 与云端 Review provider 的 Codex CLI
 
-下载模型并检查依赖：
+运行环境检查：
 
 ```sh
-./bin/pull-models
-./bin/pull-models --with-secondary
 ./bin/mvp-loop doctor
 ```
 
-下载器只在检测到本机 `127.0.0.1:7890` 代理时使用它。不要让多个大模型在 48 GB 机器上同时常驻。
+具体模型、量化方式、上下文长度、并发和资源限制由部署者根据自己的运行环境配置；本项目 README 不绑定某台设备或某个模型。正式验证依赖系统隔离能力，安装前应以 `doctor` 的结果为准。
 
 ## 安装 PATH 入口和四个平台 Skill
 
@@ -124,7 +121,7 @@ mvp-loop-supervised \
   --display summary
 ```
 
-- `--model secondary` 使用 `qwen3.6:35b`。
+- `--model secondary` 使用配置中的备用模型别名；实际模型由部署者决定。
 - `--display live` 显示经过脱敏的工具调用、文件变化、模型提供的推理摘要、Token 与顶层失败事件；不会显示或保存原始私有思维链。默认 `summary` 只保留关键状态。
 - 入口没有脏工作区绕过参数；tracked、staged 和 untracked 改动都会阻止启动。
 - 计划缺失、`.mvp-ai.toml` 缺失、Git 仓库无效或 doctor 失败时，命令以非零状态给出中文错误。
@@ -134,7 +131,7 @@ mvp-loop-supervised \
 
 验证命令通过临时 Git 包装器按目标路由。控制器把原 HEAD 的允许路径复制成无父提交的合成 HEAD，再把当前 index 的允许路径复制成合成 index；真实工作树保持不变。因此 staged、unstaged、untracked、`git diff --check` 语义仍然成立，同时目标项目只接触无历史、无 remote、无认证信息的私有 `GIT_DIR`。验证前存在的根/嵌套 `.git` 会被枚举并封锁；验证期间在项目内或临时目录中新建的测试子仓库则按自己的工作目录正常执行 `init/add/commit/status` 和 `git -C`。基线复制完全排除原 `.git`，所以验证代码无法读取预存 `FETCH_HEAD`、reflog、hooks、remote、`http.extraHeader` 或历史敏感对象。
 
-默认 `adaptive` 流程按风险和证据路由：low/medium 先由本地 Qwen 实现；high、未声明、有效声明与占位/无效声明并存等歧义风险直接由 Codex supervisor 实现关键代码。编码后的验证失败先给本地模型一次精简验证修复，验证通过后才调用 reviewer。Review finding 使用 schema 强制的结构化 `category`；P0/P1、任何 severity 的 `security`、`data_loss`、`reliability`、无法可靠分类的 `other`，或至少 5 条阻塞 finding 会立即接管。只有至多 4 条定位明确且属于 correctness/documentation/performance/testing 的 P2 才允许一次本地修复和第二轮 review；仅含这些安全类别内 P3 时才按非阻塞通过。编排器会在 supervisor 前预留强制 final review 的云端调用容量；容量不足会在云端修改前分类为配置失败，3-call low/medium 路径会跳过可能耗尽终审容量的第二轮而提前接管。接管后重新验证；验证通过才调用独立终审，验证失败会停止并省去一次无效的 final-review 调用。本地模型启动失败、崩溃、超时或连续 300 秒无进展也会触发接管。`workflow.strategy = "legacy"` 仅用于回滚，不代表 Token 优化。
+默认 `adaptive` 流程按风险和证据路由：low/medium 先由本地 coding agent 实现；high、未声明、有效声明与占位/无效声明并存等歧义风险直接由 Codex supervisor 实现关键代码。编码后的验证失败先给本地模型一次精简验证修复，验证通过后才调用 reviewer。Review finding 使用 schema 强制的结构化 `category`；P0/P1、任何 severity 的 `security`、`data_loss`、`reliability`、无法可靠分类的 `other`，或至少 5 条阻塞 finding 会立即接管。只有至多 4 条定位明确且属于 correctness/documentation/performance/testing 的 P2 才允许一次本地修复和第二轮 review；仅含这些安全类别内 P3 时才按非阻塞通过。编排器会在 supervisor 前预留强制 final review 的云端调用容量；容量不足会在云端修改前分类为配置失败，3-call low/medium 路径会跳过可能耗尽终审容量的第二轮而提前接管。接管后重新验证；验证通过才调用独立终审，验证失败会停止并省去一次无效的 final-review 调用。本地模型启动失败、崩溃、超时或连续 300 秒无进展也会触发接管。`workflow.strategy = "legacy"` 仅用于回滚，不代表 Token 优化。
 
 运行记录保存在目标 workspace 之外的 `~/.local/share/local-ai-mvp-builder/runs/`，每个目录权限为 `0700`，避免 workspace-write agent 篡改批准计划、日志或 summary。命令输出、验证日志、结构化 review 和 last-message 在持久化时都会拒绝符号链接、原子写入并脱敏，同时保留合法数值 Token telemetry；极限压缩的 capsule 仍会保留带哈希的完整 scope、validation manifest 和 review 证据引用。最后一次验证后的 staged、unstaged 与全部 untracked 内容快照会以固定大小分块计算并绑定到 capsule，在 reviewer 前后及写入 ready 前复核；大型 diff 或文件正文不会整体载入内存，任何漂移都会阻塞旧 verdict。只有 `summary.json` 状态为 `ready_for_user_review` 才表示可以交给用户检查。
 
@@ -176,10 +173,10 @@ test -L "$HOME/.local/bin/mvp-loop-supervised" && rm "$HOME/.local/bin/mvp-loop-
 
 ## 安全和公开边界
 
-- 本地 coding 使用受限工作区，验证命令在 macOS Seatbelt 中禁止网络、Git 元数据写入和敏感文件读取。
+- 本地 coding 使用受限工作区；验证命令通过受支持的系统隔离后端禁止网络、Git 元数据写入和敏感文件读取。
 - Skill 和启动器不授予 commit、push、tag、release 或 PR 权限。
 - Claude Code 与 Antigravity 当前不充当 reviewer/supervisor；相关后端仍固定为云端 Codex。
 - 不提交本地状态目录中的运行证据、模型权重、凭据、用户 Agent 配置、真实 token、私有远程地址或个人绝对路径。
 - `summary.json.version_control` 只记录安全的分支、基线 commit、remote 名称和建议提交信息，不记录 remote URL。
 
-更多背景见[硬件与模型评估](docs/hardware-and-model-assessment.md)、[实施计划](docs/implementation-plan.md)和[验证报告](docs/verification-report.md)。本项目使用 [MIT License](LICENSE)。
+更多背景见[实施计划](docs/implementation-plan.md)和[验证报告](docs/verification-report.md)。本项目使用 [MIT License](LICENSE)。

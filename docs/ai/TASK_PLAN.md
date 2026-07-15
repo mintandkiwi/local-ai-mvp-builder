@@ -18,6 +18,7 @@ M4：Local AI MVP Builder Token 效率整改。目标是完成 TE-001 至 TE-009
 - `TE-009B`：独立 `review-4` 至 `review-35` 共发现 25 个 P1、77 个 P2（`review-15`、`review-26` 无 verdict）；全部有效 finding 已修复，原生回归由 68 项增至 143 项，并覆盖外置证据、内容快照、风险/类别策略、凭据脱敏、去敏 Git 视图、子仓库路由和事务安装。
 - `TE-009C`：`review-36` 核验 12 项门禁、完整证据哈希和冻结快照后返回 `pass`、0 finding；summary 已达到 `ready_for_user_review`。
 - `RELEASE-001`：完成中英文 README、143 项发布前回归和辅助门禁；提交 `b295221` 已推送到 `origin/agent/cross-agent-skill`，现有 Draft PR #1 自动纳入升级。
+- `RELEASE-002`：将公开中英文 README 改为部署无关说明，移除维护者机器容量、具体模型、个人代理和硬件评估入口，保留可配置后端与 `doctor` 兼容性门禁。
 
 ## 进行中
 
