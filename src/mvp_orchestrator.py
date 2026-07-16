@@ -2313,13 +2313,43 @@ def plan_declared_project_paths(project: Path, plan_path: Path) -> list[str]:
         "PRIVACY.md",
         "README.md",
     }
+    exclusion_markers = (
+        "outside scope",
+        "out of scope",
+        "must not",
+        "do not modify",
+        "do not create",
+        "do not use",
+        "do not stage",
+        "do not commit",
+        "excluded",
+        "exclude",
+        "禁止",
+        "不得",
+        "不要修改",
+        "不要创建",
+        "不要使用",
+        "排除",
+    )
     declared: set[str] = set()
+    sentence_boundary = re.compile(
+        r"(?:[.!?。！？;；](?:[ \t]+|\r?\n)|\r?\n[ \t]*\r?\n)"
+    )
     for match in re.finditer(r"`([^`\r\n]+)`", text):
         raw = match.group(1).strip().replace("\\", "/")
+        context_start = 0
+        for boundary in sentence_boundary.finditer(text, 0, match.start()):
+            context_start = boundary.end()
+        next_boundary = sentence_boundary.search(text, match.end())
+        context_end = next_boundary.start() if next_boundary else len(text)
+        context = text[context_start:context_end].lower()
         if (
             not raw
             or any(character.isspace() for character in raw)
             or raw.startswith(("$", "-", "http://", "https://"))
+            or any(marker in context for marker in exclusion_markers)
+            or re.fullmatch(r"[^/\s`]+\.\.[^/\s`]+", raw)
+            or re.fullmatch(r"\d{8}-\d{6}-[^/\s`]+", raw)
         ):
             continue
         is_directory = raw.endswith("/")
@@ -2333,7 +2363,8 @@ def plan_declared_project_paths(project: Path, plan_path: Path) -> list[str]:
         ):
             continue
         if (
-            "/" not in normalized
+            not is_directory
+            and "/" not in normalized
             and normalized not in safe_basenames
             and not relative.suffix
         ):

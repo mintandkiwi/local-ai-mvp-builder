@@ -915,10 +915,13 @@ class OrchestratorTests(unittest.TestCase):
             project = root / "project"
             run_dir = root / "run"
             (project / "src" / "shared").mkdir(parents=True)
+            (project / "scripts").mkdir()
             run_dir.mkdir()
             subprocess.run(["git", "init", "-q"], cwd=project, check=True)
             existing = project / "src" / "shared" / "existing.ts"
             existing.write_text("export {}\n", encoding="utf-8")
+            release_script = project / "scripts" / "package-release.mjs"
+            release_script.write_text("export {}\n", encoding="utf-8")
             subprocess.run(["git", "add", "."], cwd=project, check=True)
             subprocess.run(
                 [
@@ -932,7 +935,11 @@ class OrchestratorTests(unittest.TestCase):
             plan.write_text(
                 "Risk classification: high\n"
                 "Modify `src/shared/`, `src/background/service-worker.ts`, "
-                "and `package.json`. Validate with `npm run package:release`.\n",
+                "`scripts/`, and `package.json`. "
+                "The user file `2026-07-13.md` is outside scope and must not "
+                "be modified. Review `da5b247..HEAD`. "
+                "Prior run `20260716-143958-candidate-deadbeef` failed. "
+                "Validate with `npm run package:release`.\n",
                 encoding="utf-8",
             )
             log = run_dir / "baseline.log"
@@ -956,12 +963,26 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIn("src/shared/", scope["allowed_files"])
         self.assertIn("src/shared/existing.ts", scope["allowed_files"])
         self.assertIn("src/background/service-worker.ts", scope["allowed_files"])
+        self.assertIn("scripts/", scope["allowed_files"])
+        self.assertIn("scripts/package-release.mjs", scope["allowed_files"])
         self.assertIn("package.json", scope["allowed_files"])
+        self.assertNotIn("2026-07-13.md", scope["allowed_files"])
+        self.assertNotIn("da5b247..HEAD", scope["allowed_files"])
+        self.assertNotIn(
+            "20260716-143958-candidate-deadbeef", scope["allowed_files"]
+        )
         self.assertIn("npm run package:release", scope["planned_post_edit_commands"])
         self.assertEqual(validation["validation_phase"], "pre_implementation_baseline")
         self.assertIn(
             "npm run package:release", validation["planned_post_edit_commands"]
         )
+
+    def test_supervisor_prompt_frames_documents_at_final_review_time(self):
+        prompt = (
+            Path(__file__).resolve().parents[1] / "prompts" / "supervisor.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("独立终审读取时", prompt)
+        self.assertIn("不得写成 post-edit scope", prompt)
 
     def test_review_evidence_preserves_tail_after_sensitive_inline_example(self):
         with tempfile.TemporaryDirectory() as directory:

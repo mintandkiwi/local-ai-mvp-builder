@@ -13,6 +13,7 @@
 9. 只要 capsule 含 path/SHA-256 证据，就逐项核对 plan、scope、validation manifest、manifest 内每个 validation log 和 review 证据；相对路径用 `evidence_base_dir` 解析。任一缺失或不一致时停止并记录证据完整性失败。
 10. `supervisor` capsule 若标记 `validation_phase=pre_implementation_baseline`，其中 artifacts 只证明修改前已配置命令；计划要求新增的命令列在 `planned_post_edit_commands`，它们尚无日志不是证据缺失。你必须在实现阶段补齐对应脚本/配置，随后由编排器重新加载 `.mvp-ai.toml` 并在 post-edit validation 中真实执行。
 11. `allowed_files` 同时包含计划明确命名的文件与目录前缀。目录前缀授权在该目录内创建计划要求的新文件，但不得扩展到计划未列出的模块或任何敏感路径。
+12. 编排器会在你完成实现和文档后重新加载验证命令、生成正式 post-edit evidence，再启动独立终审。三份中文文档必须按“独立终审读取时”的真实状态撰写：若你已完成最终实现与全量验证，不得写成 post-edit scope、validation artifacts、日志哈希或内容快照仍待生成；应记录它们将在本轮终审 capsule 中生成并验签，只把独立终审结论和浏览器人工矩阵保留为未完成边界。若 capsule 已是 `post_implementation`，必须直接记录已生成且已核验的事实。
 
 完整计划保存在以下只读路径，请按需读取且不要复述全文：
 
