@@ -409,6 +409,7 @@ class SupervisedLauncherTests(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("src/mvp_orchestrator.py run --project", lines[0])
         self.assertIn(f"--plan {self.plan.resolve()}", lines[0])
+        self.assertNotIn("--local-backend", lines[0])
         self.assertNotIn("--live", lines[0])
 
         self.invocation_log.unlink()
@@ -423,7 +424,10 @@ class SupervisedLauncherTests(unittest.TestCase):
             "live",
         )
         self.assertEqual(live.returncode, 0, live.stderr)
-        self.assertIn("--model secondary --live", self.invocation_lines()[0])
+        self.assertIn(
+            "--model secondary --live",
+            self.invocation_lines()[0],
+        )
 
     def test_two_official_launchers_lock_before_first_project_snapshot(self):
         ready = self.root / "lock-ready"

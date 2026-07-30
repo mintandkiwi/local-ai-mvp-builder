@@ -2,7 +2,7 @@
 
 [中文](README.md) | [English](README_EN.md)
 
-Local AI MVP Builder provides one repository-managed Agent Skill that connects Codex, Claude Code, Antigravity IDE, and Antigravity CLI to a supervised MVP development loop. All four frontends are workflow entry points: Codex CLI drives a coding agent through a configurable local inference backend, while cloud Codex remains responsible for structured code review, watchdog takeover, and final approval.
+Local AI MVP Builder provides one repository-managed Agent Skill that connects Codex, Claude Code, Antigravity IDE, and Antigravity CLI to a supervised MVP development loop. All four frontends are workflow entry points. An OpenCode Agent is the default local coding backend; Codex-to-local inference is an explicit backup. Cloud Codex remains responsible for structured code review, watchdog takeover, and final approval.
 
 The workflow never commits, pushes, switches branches, creates repositories, or publishes releases automatically. Final changes remain in the target repository for human review.
 
@@ -18,7 +18,8 @@ Codex / Claude Code / Antigravity IDE / Antigravity CLI
  doctor + clean Git + risk/plan/config + baseline gates
                          │
               src/mvp_orchestrator.py run
-                 ├─ local coding agent
+                 ├─ OpenCode local coding agent (primary)
+                 ├─ Codex-to-local backend (explicit backup)
                  ├─ project validations
                  ├─ cloud Codex reviewer
                  └─ cloud Codex takeover supervisor
@@ -30,8 +31,8 @@ Codex / Claude Code / Antigravity IDE / Antigravity CLI
 
 - Python 3.11 or later, including the standard-library `tomllib`
 - POSIX shell, Git, and a system-isolation backend supported by this release
-- A configured local inference backend with a coding-capable model
-- Codex CLI authenticated for both the local provider and the cloud review provider
+- OpenCode CLI and a configured Ollama-compatible local inference backend with a coding-capable model
+- Codex CLI authenticated for the cloud review provider; the backup route also needs a local provider
 
 Verify the runtime environment:
 
@@ -118,10 +119,12 @@ mvp-loop-supervised \
   --project "/absolute/path/to/project" \
   --plan "$HOME/.local/share/local-ai-mvp-builder/plans/project-plan.md" \
   --model primary \
+  --local-backend opencode \
   --display summary
 ```
 
 - `--model secondary` selects the configured secondary model alias; the deployment owner chooses the actual model.
+- `--local-backend opencode` is the default primary route. `--local-backend codex-ollama` is an explicit compatibility backup. An OpenCode failure never causes a silent backend switch; the watchdog hands the task to the Codex supervisor.
 - `--display live` shows redacted tool calls, file changes, model-provided reasoning summaries, Token usage, and top-level failure events. It never displays or stores private raw chains of thought. The default `summary` mode keeps only essential status updates.
 - There is no dirty-worktree bypass. Tracked, staged, and untracked changes all block startup.
 - A missing plan, missing `.mvp-ai.toml`, invalid Git repository, or failed doctor check exits nonzero with a Chinese error message.
@@ -131,7 +134,7 @@ Before any model can modify files, the orchestrator acquires an external project
 
 Validation commands use a temporary Git wrapper that routes each target correctly. The controller copies allowed paths from the original HEAD into a synthetic parentless commit, then copies allowed paths from the current index into a synthetic index while leaving the real worktree unchanged. This preserves staged, unstaged, untracked, and `git diff --check` semantics while exposing only a private `GIT_DIR` without history, remotes, or authentication data. Every root or nested `.git` that existed before validation is enumerated and denied. Test repositories created during validation, inside either the project or temporary directories, use normal per-working-directory discovery for `init/add/commit/status` and `git -C`. The baseline copy excludes the entire original `.git`, so validation code cannot read existing `FETCH_HEAD`, reflogs, hooks, remotes, `http.extraHeader`, or sensitive historical objects.
 
-The default `adaptive` strategy routes by risk and evidence. Low- and medium-risk tasks start with the local coding agent. High, undeclared, or ambiguous risk, including valid declarations mixed with placeholders or invalid declarations, sends critical implementation directly to the Codex supervisor. A post-coding validation failure receives one focused local repair before any reviewer call. After validation passes, every review finding has a schema-enforced `category`. P0/P1 findings, any-severity `security`, `data_loss`, `reliability`, unclassifiable `other`, or at least five blocking findings trigger immediate takeover. At most four localized P2 findings in correctness, documentation, performance, or testing may receive one local repair followed by a second review. P3-only results are non-blocking only when all categories are from that safe set. The orchestrator reserves cloud capacity for both supervisor work and mandatory final review. Insufficient capacity fails as `cloud_call_limit_configuration` before any cloud mutation. With only three calls available on a low/medium route, it prefers takeover after review one instead of risking the final gate on a second review. After takeover it validates again and runs independent final review only when validation succeeds. Local startup failure, crash, timeout, or five minutes without progress also triggers watchdog takeover. `workflow.strategy = "legacy"` exists only for rollback and must not be described as Token-optimized.
+The default `adaptive` strategy routes by risk and evidence. Low- and medium-risk tasks start in a second sanitized disposable implementation workspace controlled by the OpenCode Agent; the real target is not writable by the local Agent. The candidate excludes repository-local `opencode.json`/`opencode.jsonc` and `.opencode`; the local Agent may neither modify nor promote those control files, preventing project configuration from merging in MCP servers, plugins, or replacement Agents. A plan that genuinely changes one of those controls routes directly to the cloud supervisor before a candidate is created. OpenCode receives a private per-run configuration, deny-by-default non-edit permissions, no plugins/MCP/subagents/web tools, a minimal allowlisted environment, isolated HOME/XDG state, only the configured exact loopback Ollama `host:port`, and a system process sandbox. The supported OpenCode version does not apply granular edit maps from Agent Markdown, so the effective edit grant exists only inside the disposable candidate; the candidate Git-visible-diff gate and transactional promotion enforce plan scope and cannot expand it to the real target. The full approved prompt is delivered through OpenCode's supported private `--file` attachment; argv contains only a fixed instruction and timeout/watchdog records never contain the prompt body. After independent review passes, validation runs again in that disposable candidate; any unreviewed Git-visible validation side effect rejects promotion. Only plan-declared paths plus the three required Chinese documents can be promoted. Promotion rolls back for scope violations, symlinks, target drift, or candidate-validation failure. Once reviewed files are transactionally written, a private-backup cleanup fault is recorded as pending in the summary instead of creating a partial rollback; the workflow does not run `git commit` automatically. High, undeclared, or ambiguous risk sends critical implementation directly to the Codex supervisor. A post-coding validation failure receives one focused repair in the same OpenCode Session before any reviewer call. P0/P1 findings, any-severity `security`, `data_loss`, `reliability`, unclassifiable `other`, or at least five blocking findings trigger immediate takeover. At most four localized safe-category P2 findings may receive one local repair followed by a second review. After takeover, validation must pass before mandatory independent final review. Local startup failure, crash, timeout, or five minutes without progress triggers supervisor takeover rather than a silent backend switch. `workflow.strategy = "legacy"` is rollback-only.
 
 Run records live outside the target workspace under `~/.local/share/local-ai-mvp-builder/runs/`, with each directory restricted to mode `0700`. This prevents a workspace-write agent from altering approved plans, logs, or summaries. Persisted command output, validation logs, structured reviews, and last messages reject symlinks, use atomic writes, and are redacted while retaining valid numeric Token telemetry. Even a highly compacted capsule retains hashed references to complete scope, validation-manifest, and review evidence. A fixed-memory content snapshot binds staged, unstaged, and every untracked file after final validation; it is rechecked before and after review and again before ready handoff. Large diffs and files are streamed rather than loaded fully into memory. Any drift blocks reuse of the old verdict. A run can be handed to the user only when `summary.json.status` is `ready_for_user_review`.
 
@@ -175,7 +178,7 @@ If `--force` created a backup, inspect the chosen timestamp under `~/.local/shar
 
 ## Security and Publication Boundaries
 
-- Local coding uses a restricted workspace. Validation commands use a supported system-isolation backend that denies network access, Git metadata writes, and sensitive-file reads.
+- OpenCode coding uses a sanitized disposable workspace, per-run deny-by-default non-edit permissions, and a system process sandbox; effective edit permission exists only in the candidate while candidate-diff and transactional-promotion gates enforce scope, so it cannot write the real target directly. Validation commands separately deny network access, Git metadata writes, and sensitive-file reads.
 - The Skill and launcher do not grant commit, push, tag, release, or PR permissions.
 - Claude Code and Antigravity do not currently act as reviewer or supervisor; those backends remain cloud Codex.
 - Never commit local run evidence, model weights, credentials, user Agent configuration, real Tokens, private remote addresses, or personal absolute paths.

@@ -21,6 +21,7 @@ import tempfile
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,9 @@ DEFAULTS_PATH = ROOT / "config" / "defaults.toml"
 MODELS_PATH = ROOT / "config" / "models.toml"
 REVIEW_SCHEMA = ROOT / "schemas" / "review.schema.json"
 PROMPTS = ROOT / "prompts"
+OPENCODE_AGENT_TEMPLATE = (
+    ROOT / "integrations" / "opencode" / "agents" / "local-mvp-coder.md"
+)
 
 SENSITIVE_FIELD_FRAGMENT = (
     r"(?:(?!(?:input|output|cached[_-]?input|reasoning[_-]?output|total|soft)"
@@ -171,6 +175,19 @@ BASELINE_SECRET_EXCLUDES = (
     "*secret*.ini",
 )
 
+# OpenCode merges a repository's ``opencode.json`` and ``.opencode`` directory
+# after the private runtime configuration. Those files can define MCP servers,
+# plugins, or replacement agents, so they must never be visible in the
+# disposable workspace used by the supervised OpenCode route. This is kept
+# separate from ``BASELINE_SECRET_EXCLUDES``: ordinary baseline validation
+# should still exercise a project's normal files, while only the implementation
+# Agent needs this OpenCode-specific isolation.
+OPENCODE_PROJECT_CONTROL_EXCLUDES = (
+    "opencode.json",
+    "opencode.jsonc",
+    ".opencode",
+)
+
 
 class WorkflowError(RuntimeError):
     pass
@@ -227,6 +244,12 @@ class Settings:
     context_capsule_max_bytes: int
     codex_command: str
     ollama_host: str
+    local_backend: str
+    opencode_command: str
+    opencode_agent: str
+    opencode_temperature: float
+    opencode_low_max_steps: int
+    opencode_medium_max_steps: int
     cloud_provider: str
     cloud_model: str
     cloud_reasoning_effort: str
@@ -243,6 +266,7 @@ def load_settings() -> Settings:
     raw = load_toml(DEFAULTS_PATH)
     workflow = raw["workflow"]
     runtime = raw["runtime"]
+    local = raw.get("local", {})
     cloud = raw["cloud"]
     return Settings(
         max_local_review_rounds=int(workflow["max_local_review_rounds"]),
@@ -258,6 +282,14 @@ def load_settings() -> Settings:
         ),
         codex_command=str(runtime["codex_command"]),
         ollama_host=str(runtime["ollama_host"]),
+        local_backend=str(local.get("backend", "opencode")),
+        opencode_command=str(local.get("opencode_command", "opencode")),
+        opencode_agent=str(local.get("opencode_agent", "local-mvp-coder")),
+        opencode_temperature=float(local.get("opencode_temperature", 0.1)),
+        opencode_low_max_steps=int(local.get("opencode_low_max_steps", 10)),
+        opencode_medium_max_steps=int(
+            local.get("opencode_medium_max_steps", 16)
+        ),
         cloud_provider=str(cloud["provider"]),
         cloud_model=str(cloud["model"]),
         cloud_reasoning_effort=str(cloud["reasoning_effort"]),
@@ -589,11 +621,21 @@ def parse_token_usage(output: str) -> dict[str, Any]:
     command_header = next(
         (line for line in lines[:5] if line.startswith("command: ")), None
     )
-    explicit_json_events = bool(
-        command_header is not None and '"--json"' in command_header
+    command_parts: list[Any] = []
+    if command_header is not None:
+        try:
+            parsed_command = json.loads(command_header.removeprefix("command: "))
+            if isinstance(parsed_command, list):
+                command_parts = parsed_command
+        except json.JSONDecodeError:
+            pass
+    explicit_json_events = "--json" in command_parts or any(
+        command_parts[index : index + 2] == ["--format", "json"]
+        for index in range(len(command_parts) - 1)
     )
     json_events_expected = command_header is None or explicit_json_events
     completed: list[Any] = []
+    opencode_steps: list[dict[str, Any]] = []
     saw_json_event = False
     for line in lines if json_events_expected else []:
         try:
@@ -605,6 +647,10 @@ def parse_token_usage(output: str) -> dict[str, Any]:
             continue
         if event.get("type") == "turn.completed":
             completed.append(event.get("usage"))
+        if event.get("type") == "step_finish":
+            part = event.get("part")
+            if isinstance(part, dict):
+                opencode_steps.append(part)
     if completed:
         usage = completed[-1]
         if isinstance(usage, dict):
@@ -633,6 +679,42 @@ def parse_token_usage(output: str) -> dict[str, Any]:
                     "measurement": "exact",
                 }
         return unavailable_usage()
+    if opencode_steps:
+        totals = {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+        }
+        for part in opencode_steps:
+            tokens = part.get("tokens")
+            if not isinstance(tokens, dict):
+                return unavailable_usage()
+            input_tokens = _usage_number(tokens.get("input"))
+            output_tokens = _usage_number(tokens.get("output"))
+            reasoning_tokens = _usage_number(tokens.get("reasoning", 0))
+            total_tokens = _usage_number(tokens.get("total"))
+            cache = tokens.get("cache", {})
+            if not isinstance(cache, dict):
+                return unavailable_usage()
+            cached_tokens = _usage_number(cache.get("read", 0))
+            if None in (
+                input_tokens,
+                output_tokens,
+                reasoning_tokens,
+                total_tokens,
+                cached_tokens,
+            ):
+                return unavailable_usage()
+            if total_tokens < input_tokens + output_tokens:
+                return unavailable_usage()
+            totals["input_tokens"] += input_tokens
+            totals["cached_input_tokens"] += cached_tokens
+            totals["output_tokens"] += output_tokens
+            totals["reasoning_output_tokens"] += reasoning_tokens
+            totals["total_tokens"] += total_tokens
+        return {**totals, "measurement": "exact"}
     if explicit_json_events or saw_json_event:
         return unavailable_usage()
     matches = TOKENS_USED.findall(output)
@@ -977,6 +1059,46 @@ def display_codex_event(line: str, channel: str) -> None:
             emit_progress(channel, "运行提示：" + message)
 
 
+def display_opencode_event(line: str, channel: str) -> None:
+    """Render safe summaries from ``opencode run --format json`` events."""
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(event, dict):
+        return
+    event_type = str(event.get("type", ""))
+    part = event.get("part")
+    if not isinstance(part, dict):
+        part = {}
+    if event_type == "step_start":
+        emit_progress(channel, "OpenCode Agent 开始下一步")
+    elif event_type == "step_finish":
+        tokens = part.get("tokens")
+        if not isinstance(tokens, dict):
+            tokens = {}
+        emit_progress(
+            channel,
+            "OpenCode 步骤结束"
+            f"（输入 {tokens.get('input', '?')} tokens，"
+            f"输出 {tokens.get('output', '?')} tokens）",
+        )
+    elif event_type == "tool_use":
+        tool = str(part.get("tool", "tool"))
+        state = part.get("state")
+        if not isinstance(state, dict):
+            state = {}
+        status = str(state.get("status", "unknown"))
+        emit_progress(channel, f"OpenCode 工具：{tool}（{status}）")
+    elif event_type == "error":
+        message = event.get("message") or part.get("message") or "运行失败"
+        emit_progress(channel, "OpenCode 运行提示：" + str(message))
+    elif event_type == "text" and part.get("synthetic") is True:
+        summary = part.get("text")
+        if isinstance(summary, str) and summary.strip():
+            emit_progress(channel, "OpenCode 摘要：" + summary)
+
+
 def is_progress_event(line: str, json_events: bool) -> bool:
     if not json_events:
         return True
@@ -995,7 +1117,25 @@ def is_progress_event(line: str, json_events: bool) -> bool:
         "item.started",
         "item.updated",
         "item.completed",
+        "step_start",
+        "tool_use",
+        "step_finish",
+        "text",
     }
+
+
+def display_json_event(line: str, channel: str) -> None:
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        display_codex_event(line, channel)
+        return
+    if isinstance(event, dict) and event.get("type") in {
+        "step_start", "tool_use", "step_finish", "text"
+    }:
+        display_opencode_event(line, channel)
+    else:
+        display_codex_event(line, channel)
 
 
 def run_streaming_process(
@@ -1072,7 +1212,7 @@ def run_streaming_process(
                 output.append(line)
                 if display:
                     if json_events:
-                        display_codex_event(line, channel)
+                        display_json_event(line, channel)
                     else:
                         emit_progress(channel, line)
             if process.poll() is not None:
@@ -1082,7 +1222,7 @@ def run_streaming_process(
                     if display:
                         for line in tail.splitlines():
                             if json_events:
-                                display_codex_event(line, channel)
+                                display_json_event(line, channel)
                             else:
                                 emit_progress(channel, line)
                 break
@@ -1108,14 +1248,23 @@ def run_command(
     live_channel: str = "PROCESS",
     json_events: bool = False,
     idle_timeout: int | None = None,
+    extra_env: dict[str, str] | None = None,
+    command_for_log: list[str] | None = None,
+    clean_environment: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     started = time.monotonic()
-    env = os.environ.copy()
+    env = (
+        clean_child_environment()
+        if clean_environment
+        else os.environ.copy()
+    )
     env.setdefault("NO_COLOR", "1")
     loopback = "localhost,127.0.0.1,::1"
     env["NO_PROXY"] = loopback
     env["no_proxy"] = loopback
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env.update(extra_env or {})
+    logged_command = command_for_log or command
     try:
         if live or monitor:
             result = run_streaming_process(
@@ -1142,12 +1291,22 @@ def run_command(
                 check=False,
             )
     except subprocess.TimeoutExpired as exc:
+        # ``command_for_log`` is deliberately used for subprocess errors as
+        # well as evidence.  A caller may send an approved prompt over stdin
+        # (rather than argv); retaining the original exception command would
+        # otherwise make it too easy for a future invocation change to leak a
+        # sensitive positional argument through watchdog.json.
+        if command_for_log is not None:
+            safe_command = sanitize_command(logged_command)
+            exc.cmd = safe_command
+            exc.args = (safe_command, exc.timeout)
+            setattr(exc, "mvp_safe_command", safe_command)
         elapsed = time.monotonic() - started
         output = exc.stdout or ""
         if isinstance(output, bytes):
             output = output.decode(errors="replace")
         header = (
-            f"command: {json.dumps(sanitize_command(command), ensure_ascii=False)}\n"
+            f"command: {json.dumps(sanitize_command(logged_command), ensure_ascii=False)}\n"
             f"exit_code: 124\n"
             f"elapsed_seconds: {elapsed:.2f}\n"
             f"error: timeout\n\n"
@@ -1164,7 +1323,7 @@ def run_command(
         raise
     elapsed = time.monotonic() - started
     header = (
-        f"command: {json.dumps(sanitize_command(command), ensure_ascii=False)}\n"
+        f"command: {json.dumps(sanitize_command(logged_command), ensure_ascii=False)}\n"
         f"exit_code: {result.returncode}\n"
         f"elapsed_seconds: {elapsed:.2f}\n\n"
     )
@@ -1187,6 +1346,31 @@ def run_command(
             log_path=log_path,
         )
     return result
+
+
+def clean_child_environment() -> dict[str, str]:
+    """Return a non-secret environment for a local untrusted Agent process."""
+    path_entries = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ]
+    for executable in (
+        "git", "python3", "node", "npm", "pnpm", "uv", "cargo", "rustc"
+    ):
+        resolved = shutil.which(executable)
+        if resolved:
+            path_entries.append(str(Path(resolved).resolve().parent))
+    unique_paths = list(dict.fromkeys(path_entries))
+    env = {"PATH": os.pathsep.join(unique_paths)}
+    for key in ("LANG", "LC_ALL", "TZ", "TERM"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    return env
 
 
 def git_output(project: Path, *args: str) -> str:
@@ -1386,6 +1570,28 @@ def verify_project_content_snapshot(project: Path, expected: dict[str, Any]) -> 
         raise ProjectChangedError("项目内容在验证或评审快照之后发生变化")
 
 
+def promoted_target_content_snapshot(
+    target: Path, expected_candidate: dict[str, Any]
+) -> dict[str, Any]:
+    """Freeze the exact reviewed candidate content after transactional copy.
+
+    Candidate workspaces use a synthetic Git HEAD, so their ``head`` values
+    intentionally differ from the real target.  The content digest and
+    changed-file count must nevertheless be identical after promotion.  A
+    mismatch means an external writer changed the target during the promotion
+    window; do not create a ready-for-user handoff for that mixed state.
+    """
+    current = project_content_snapshot(target)
+    if (
+        current.get("sha256") != expected_candidate.get("sha256")
+        or current.get("changed_count") != expected_candidate.get("changed_count")
+    ):
+        raise ProjectChangedError(
+            "事务式回写后目标项目包含未评审的并发内容变化"
+        )
+    return current
+
+
 def verify_project_integrity_snapshot(
     project: Path, expected: dict[str, str]
 ) -> None:
@@ -1405,7 +1611,7 @@ def validate_project(project: Path, require_clean: bool) -> None:
         raise WorkflowError("目标目录必须是 Git 仓库")
     if require_clean and git_output(project, "status", "--porcelain").strip():
         raise WorkflowError(
-            "目标仓库不是干净状态。请先处理现有改动，或明确使用 --allow-dirty。"
+            "目标仓库不是干净状态。请先处理现有改动后再启动受监督工作流。"
         )
 
 
@@ -1911,9 +2117,18 @@ def validation_environment(validation_dir: Path) -> dict[str, str]:
 
 
 def make_disposable_baseline_workspace(
-    project: Path, run_dir: Path
+    project: Path,
+    run_dir: Path,
+    *,
+    exclude_opencode_project_controls: bool = False,
 ) -> tuple[Path, Path]:
-    """Create a private, sanitized workspace for writable baseline tests."""
+    """Create a private, sanitized workspace for writable checks or coding.
+
+    The OpenCode implementation workspace excludes repository-local OpenCode
+    controls. OpenCode merges those controls after ``OPENCODE_CONFIG`` even
+    with ``--pure``; retaining them would let an untrusted project add MCP,
+    plugin, or Agent behavior outside the supervisor's per-run policy.
+    """
     project = project.resolve(strict=True)
     container = Path(
         tempfile.mkdtemp(
@@ -1928,6 +2143,9 @@ def make_disposable_baseline_workspace(
         command = ["/usr/bin/rsync", "-a"]
         for pattern in BASELINE_SECRET_EXCLUDES:
             command.append(f"--exclude={pattern}")
+        if exclude_opencode_project_controls:
+            for pattern in OPENCODE_PROJECT_CONTROL_EXCLUDES:
+                command.append(f"--exclude={pattern}")
         command.extend([str(project) + "/", str(workspace) + "/"])
         result = subprocess.run(
             command,
@@ -1951,6 +2169,14 @@ def make_disposable_baseline_workspace(
         ]
         if leaked:
             raise WorkflowError("基线工作副本包含被禁止的敏感路径")
+        if exclude_opencode_project_controls:
+            leaked_controls = [
+                path
+                for path in workspace.rglob("*")
+                if is_opencode_project_control_path(path.relative_to(workspace))
+            ]
+            if leaked_controls:
+                raise WorkflowError("实现工作副本包含 OpenCode 项目控制文件")
         git_binary = Path(
             "/Applications/Xcode.app/Contents/Developer/usr/bin/git"
         )
@@ -2007,11 +2233,242 @@ def is_baseline_secret_path(relative: Path) -> bool:
     )
 
 
+def is_opencode_project_control_path(relative: Path) -> bool:
+    """Whether a path can be loaded as repository-local OpenCode control."""
+    return (
+        relative.name.lower() in {"opencode.json", "opencode.jsonc"}
+        or any(part.lower() == ".opencode" for part in relative.parts)
+    )
+
+
 def cleanup_baseline_workspace(container: Path) -> None:
     """Remove a private baseline tree and fail closed if anything remains."""
     cleanup_private_tree(
         container, BaselineCleanupError, "基线工作副本"
     )
+
+
+def _safe_promotion_path(relative: str) -> Path:
+    path = Path(relative)
+    if (
+        not relative
+        or path.is_absolute()
+        or ".." in path.parts
+        or is_baseline_secret_path(path)
+    ):
+        raise WorkflowError("实现工作区包含禁止回写的路径")
+    return path
+
+
+def _promotion_path_allowed(relative: str, allowed: set[str]) -> bool:
+    if relative in allowed:
+        return True
+    return any(
+        entry.endswith("/") and relative.startswith(entry)
+        for entry in allowed
+    )
+
+
+def _reject_symlink_path(root: Path, relative: Path, *, include_leaf: bool) -> None:
+    current = root
+    parts = relative.parts if include_leaf else relative.parts[:-1]
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise WorkflowError("事务式回写拒绝符号链接路径")
+
+
+def promote_implementation_workspace(
+    workspace: Path,
+    target: Path,
+    run_dir: Path,
+    plan_path: Path,
+    expected_target_snapshot: dict[str, str],
+    validate_action,
+    *,
+    run_date: str | None = None,
+) -> tuple[list[str], Any, str | None]:
+    """Validate then atomically promote an approved disposable-tree diff.
+
+    ``validate_action`` receives the disposable implementation workspace, not
+    the real target.  Validation commands are allowed to create build output;
+    keeping them in that disposable tree prevents an unreviewed artifact from
+    reaching the target.  They must leave the Git-visible candidate diff
+    unchanged before the transaction may start. Once all reviewed files have
+    been written, promotion is complete; private-backup cleanup then becomes
+    non-transactional garbage collection and can only produce a warning.
+    """
+    workspace = workspace.resolve(strict=True)
+    target = target.resolve(strict=True)
+    verify_project_integrity_snapshot(target, expected_target_snapshot)
+    changed = git_changed_files(workspace)
+    allowed = set(plan_declared_project_paths(workspace, plan_path))
+    today = run_date or dt.date.today().isoformat()
+    allowed.update(
+        {
+            f"docs/devlog/{today}.md",
+            "docs/ai/PROJECT_OUTLINE.md",
+            "docs/ai/TASK_PLAN.md",
+        }
+    )
+    if not changed:
+        raise WorkflowError("实现工作区没有可回写的变更")
+    reviewed_candidate_snapshot = project_content_snapshot(workspace)
+    for relative in changed:
+        safe = _safe_promotion_path(relative)
+        if is_opencode_project_control_path(safe):
+            raise WorkflowError("OpenCode 项目控制文件不允许由本地 Agent 回写")
+        if not _promotion_path_allowed(safe.as_posix(), allowed):
+            raise WorkflowError(f"实现工作区越出批准范围：{safe.as_posix()}")
+        _reject_symlink_path(workspace, safe, include_leaf=True)
+        _reject_symlink_path(target, safe, include_leaf=True)
+        source = workspace / safe
+        if source.exists() and not source.is_file():
+            raise WorkflowError("事务式回写仅支持常规文件")
+        destination = target / safe
+        if destination.exists() and not destination.is_file():
+            raise WorkflowError("目标路径不是常规文件，拒绝回写")
+
+    backup_container = Path(
+        tempfile.mkdtemp(prefix=f".{run_dir.name}-promotion-backup-", dir=run_dir.parent)
+    )
+    backup_container.chmod(0o700)
+    missing_before: set[str] = set()
+    backed_up: set[str] = set()
+    promoted_paths: list[str] = []
+    promotion_complete = False
+
+    def regular_files_match(left: Path, right: Path) -> bool:
+        try:
+            left_info = left.lstat()
+            right_info = right.lstat()
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(left_info.st_mode) or not stat.S_ISREG(right_info.st_mode):
+            return False
+        if (
+            stat.S_IMODE(left_info.st_mode) != stat.S_IMODE(right_info.st_mode)
+            or left_info.st_mtime_ns != right_info.st_mtime_ns
+        ):
+            return False
+        return _stream_file_fingerprint(left) == _stream_file_fingerprint(right)
+
+    def target_matches_preimage(relative: str) -> bool:
+        safe = Path(relative)
+        destination = target / safe
+        if relative in missing_before:
+            return not os.path.lexists(destination)
+        backup = backup_container / safe
+        return regular_files_match(destination, backup)
+
+    def target_matches_candidate(relative: str) -> bool:
+        safe = Path(relative)
+        source = workspace / safe
+        destination = target / safe
+        if not source.exists():
+            return not os.path.lexists(destination)
+        return regular_files_match(destination, source)
+
+    def restore_target() -> None:
+        for relative in reversed(promoted_paths):
+            safe = Path(relative)
+            destination = target / safe
+            backup = backup_container / safe
+            # A user may have edited a previously promoted path while a later
+            # path was being processed.  Never replace that newer user edit.
+            if not target_matches_candidate(relative):
+                continue
+            if relative in missing_before:
+                destination.unlink(missing_ok=True)
+                continue
+            if relative not in backed_up:
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{destination.name}.rollback.", dir=destination.parent
+            )
+            os.close(descriptor)
+            temporary_path = Path(temporary_name)
+            try:
+                shutil.copy2(backup, temporary_path)
+                os.replace(temporary_path, destination)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+
+    try:
+        validation_result = validate_action(workspace)
+        try:
+            verify_project_content_snapshot(workspace, reviewed_candidate_snapshot)
+        except ProjectChangedError as exc:
+            raise WorkflowError(
+                "事务式回写候选在验证期间产生了未评审的 Git 可见改动"
+            ) from exc
+        # Candidate validation may be long-running.  Do not overwrite a
+        # concurrent user edit made after the earlier pre-promotion snapshot.
+        verify_project_integrity_snapshot(target, expected_target_snapshot)
+
+        for relative in changed:
+            safe = Path(relative)
+            destination = target / safe
+            backup = backup_container / safe
+            if destination.exists():
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(destination, backup)
+                backed_up.add(relative)
+            else:
+                missing_before.add(relative)
+
+        for relative in changed:
+            safe = Path(relative)
+            source = workspace / safe
+            destination = target / safe
+            if not source.exists():
+                if not target_matches_preimage(relative):
+                    raise ProjectChangedError(
+                        "事务式回写期间目标项目发生并发变化"
+                    )
+                destination.unlink(missing_ok=True)
+                promoted_paths.append(relative)
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _reject_symlink_path(target, safe, include_leaf=False)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{destination.name}.", dir=destination.parent
+            )
+            os.close(descriptor)
+            temporary_path = Path(temporary_name)
+            try:
+                shutil.copy2(source, temporary_path)
+                if not target_matches_preimage(relative):
+                    raise ProjectChangedError(
+                        "事务式回写期间目标项目发生并发变化"
+                    )
+                os.replace(temporary_path, destination)
+                promoted_paths.append(relative)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+
+        promotion_complete = True
+        try:
+            cleanup_private_tree(backup_container, WorkflowError, "事务式回写备份")
+        except Exception:
+            return (
+                changed,
+                validation_result,
+                "事务式回写备份清理待处理；已保留已验证目标，不公开内部路径或异常详情",
+            )
+        return changed, validation_result, None
+    except Exception as exc:
+        if not promotion_complete:
+            restore_target()
+            verify_project_integrity_snapshot(target, expected_target_snapshot)
+            try:
+                cleanup_private_tree(
+                    backup_container, WorkflowError, "事务式回写备份"
+                )
+            except Exception as cleanup_exc:
+                raise cleanup_exc from exc
+        raise
 
 
 def cleanup_validation_workspace(container: Path) -> None:
@@ -2386,6 +2843,14 @@ def plan_declared_project_paths(project: Path, plan_path: Path) -> list[str]:
     return sorted(declared)
 
 
+def plan_declares_opencode_project_controls(project: Path, plan_path: Path) -> bool:
+    """Whether an approved plan must bypass the local OpenCode candidate."""
+    return any(
+        is_opencode_project_control_path(Path(path))
+        for path in plan_declared_project_paths(project, plan_path)
+    )
+
+
 def plan_declared_validation_commands(plan_path: Path) -> list[str]:
     """Extract exact planned post-edit validation commands from inline code."""
     try:
@@ -2572,6 +3037,7 @@ def write_context_capsule(
     review: dict[str, Any] | None = None,
     project_snapshot: dict[str, Any] | None = None,
     max_bytes: int = 16384,
+    run_date: str | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Write bounded, redacted navigation evidence; never embed full logs/diffs."""
     validations = validations or []
@@ -2646,7 +3112,7 @@ def write_context_capsule(
             if isinstance(item, dict) and item.get("file")
         }
         | {
-            f"docs/devlog/{dt.date.today().isoformat()}.md",
+            f"docs/devlog/{run_date or dt.date.today().isoformat()}.md",
             "docs/ai/PROJECT_OUTLINE.md",
             "docs/ai/TASK_PLAN.md",
         }
@@ -3164,6 +3630,353 @@ def ensure_model_available(model: str, host: str) -> None:
         )
 
 
+def opencode_capability_probe(settings: Settings) -> dict[str, Any]:
+    if not is_loopback_ollama_endpoint(settings.ollama_host):
+        return {
+            "stage": "opencode-capability",
+            "status": "failed",
+            "classification": "local_backend_preflight",
+            "command_available": bool(shutil.which(settings.opencode_command)),
+            "ollama_endpoint_loopback": False,
+            "error": "OpenCode 主后端只允许回环 Ollama endpoint",
+        }
+    executable = shutil.which(settings.opencode_command)
+    required_flags = {
+        "--model", "--agent", "--format", "--session", "--dir", "--pure"
+    }
+    if not executable:
+        return {
+            "stage": "opencode-capability",
+            "status": "failed",
+            "classification": "local_backend_preflight",
+            "command_available": False,
+            "required_flags": sorted(required_flags),
+            "missing_flags": sorted(required_flags),
+        }
+    try:
+        result = subprocess.run(
+            [executable, "run", "--help"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=15,
+            check=False,
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "stage": "opencode-capability",
+            "status": "failed",
+            "classification": "local_backend_preflight",
+            "command_available": True,
+            "error": redact_live_text(str(exc)),
+        }
+    missing = sorted(flag for flag in required_flags if flag not in result.stdout)
+    return {
+        "stage": "opencode-capability",
+        "status": "passed" if result.returncode == 0 and not missing else "failed",
+        "classification": (
+            None
+            if result.returncode == 0 and not missing
+            else "local_backend_preflight"
+        ),
+        "command_available": True,
+        "ollama_endpoint_loopback": True,
+        "exit_code": result.returncode,
+        "required_flags": sorted(required_flags),
+        "missing_flags": missing,
+    }
+
+
+def ensure_opencode_available(settings: Settings) -> dict[str, Any]:
+    probe = opencode_capability_probe(settings)
+    if probe["status"] != "passed":
+        missing = ", ".join(probe.get("missing_flags", [])) or "capability probe"
+        raise WorkflowError(f"OpenCode 后端预检失败：{missing}")
+    return probe
+
+
+def is_loopback_ollama_endpoint(value: str) -> bool:
+    """OpenCode may contact only the host-local Ollama HTTP endpoint."""
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    return (
+        parsed.scheme in {"http", "https"}
+        and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+        and not parsed.username
+        and not parsed.password
+        and (port is None or 1 <= port <= 65535)
+    )
+
+
+def ollama_seatbelt_remote(value: str) -> str:
+    """Return the one Seatbelt-valid loopback host:port for OpenCode.
+
+    macOS Seatbelt's ``remote ip`` predicate accepts ``localhost`` (and a
+    port), but rejects numeric IPv4/IPv6 literals even when they are loopback.
+    Normalizing every accepted loopback URL to ``localhost:<port>`` preserves
+    the exact configured port without producing an invalid sandbox profile.
+    """
+    if not is_loopback_ollama_endpoint(value):
+        raise WorkflowError("OpenCode 主后端只允许有效的回环 Ollama endpoint")
+    parsed = urllib.parse.urlsplit(value)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return f"localhost:{port}"
+
+
+def _opencode_agent_body() -> str:
+    text = OPENCODE_AGENT_TEMPLATE.read_text(encoding="utf-8")
+    parts = text.split("---", 2)
+    if len(parts) != 3 or not parts[2].strip():
+        raise WorkflowError("OpenCode Agent 模板格式无效")
+    return parts[2].strip() + "\n"
+
+
+def _yaml_rule(key: str, value: str, indent: int = 4) -> str:
+    return " " * indent + json.dumps(key, ensure_ascii=False) + f": {value}"
+
+
+def prepare_opencode_runtime(
+    settings: Settings,
+    project: Path,
+    model: str,
+    run_dir: Path,
+    *,
+    risk: dict[str, Any],
+    run_date: str | None = None,
+) -> tuple[Path, dict[str, str]]:
+    """Create an isolated OpenCode config without loading global user state."""
+    if not is_loopback_ollama_endpoint(settings.ollama_host):
+        raise WorkflowError("OpenCode 主后端只允许回环 Ollama endpoint")
+    runtime = run_dir / "opencode-runtime"
+    if runtime.is_symlink():
+        raise WorkflowError("OpenCode 运行目录不能是符号链接")
+    # Keep the generated config and Agent in OpenCode's native XDG layout:
+    # $XDG_CONFIG_HOME/opencode/{opencode.json,agents/...}.  OPENCODE_CONFIG
+    # is retained as a pin, but must not be relied on to relocate discovery.
+    config_home = runtime / "config"
+    config_dir = config_home / "opencode"
+    agents_dir = config_dir / "agents"
+    home = runtime / "home"
+    data = runtime / "data"
+    state = runtime / "state"
+    cache = runtime / "cache"
+    temporary = runtime / "tmp"
+    for directory in (runtime, config_dir, agents_dir, home, data, state, cache, temporary):
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+
+    plan_path = run_dir / "plan.md"
+    allowed = set(plan_declared_project_paths(project, plan_path))
+    if any(is_opencode_project_control_path(Path(path)) for path in allowed):
+        raise WorkflowError(
+            "计划包含 OpenCode 项目控制文件；此类变更必须由云端 supervisor 接管"
+        )
+    bash_rules = [_yaml_rule("*", "deny")]
+    for command in load_validation_commands(project):
+        bash_rules.append(_yaml_rule(command, "allow"))
+    for command in ("git status --short*", "git diff --check*", "git diff *"):
+        bash_rules.append(_yaml_rule(command, "allow"))
+
+    steps = (
+        settings.opencode_medium_max_steps
+        if risk.get("classification") == "medium"
+        else settings.opencode_low_max_steps
+    )
+    if not 1 <= steps <= 32:
+        raise WorkflowError("OpenCode Agent steps 必须在 1 到 32 之间")
+    if not 0.0 <= settings.opencode_temperature <= 0.3:
+        raise WorkflowError("OpenCode Agent temperature 必须在 0.0 到 0.3 之间")
+
+    frontmatter = [
+        "---",
+        "description: 受 Local AI MVP Builder 监督的最小变更本地编码 Agent",
+        "mode: primary",
+        f"model: ollama/{model}",
+        f"temperature: {settings.opencode_temperature}",
+        f"steps: {steps}",
+        "permission:",
+        _yaml_rule("*", "deny", 2),
+        "  read:",
+        _yaml_rule("*", "allow"),
+        _yaml_rule("*.env", "deny"),
+        _yaml_rule("*.env.*", "deny"),
+        _yaml_rule(".git/**", "deny"),
+        "  edit:",
+        # OpenCode 1.18.x accepts granular edit maps in opencode.json, but
+        # does not apply an Agent-Markdown granular map to its edit tool.  A
+        # scalar allow is therefore required for a non-interactive run to
+        # make any scoped change.  The Agent still receives the exact scope
+        # in its prompt; the candidate-diff gate and transactional promotion
+        # remain the authoritative scope enforcement layers. The system
+        # sandbox confines this Agent to the disposable candidate, so this
+        # cannot grant access to the real target workspace.
+        "    allow",
+        "  bash:",
+        *bash_rules,
+        "  list: allow",
+        "  grep: allow",
+        "  todowrite: allow",
+        "  task: deny",
+        "  skill: deny",
+        "  webfetch: deny",
+        "  external_directory: deny",
+        "  question: deny",
+        "  doom_loop: deny",
+        "---",
+        "",
+        _opencode_agent_body(),
+    ]
+    agent_path = agents_dir / f"{settings.opencode_agent}.md"
+    atomic_write_text(agent_path, "\n".join(frontmatter))
+
+    config = {
+        "$schema": "https://opencode.ai/config.json",
+        "model": f"ollama/{model}",
+        "provider": {
+            "ollama": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Local inference",
+                "options": {"baseURL": settings.ollama_host.rstrip("/") + "/v1"},
+                "models": {model: {"name": "Local deployment model"}},
+            }
+        },
+        "mcp": {},
+    }
+    config_path = config_dir / "opencode.json"
+    atomic_write_text(
+        config_path, json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+    )
+    environment = {
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(config_home),
+        "XDG_DATA_HOME": str(data),
+        "XDG_STATE_HOME": str(state),
+        "XDG_CACHE_HOME": str(cache),
+        "TMPDIR": str(temporary),
+        "OPENCODE_CONFIG": str(config_path),
+        "OPENCODE_CONFIG_DIR": str(config_dir),
+        "NO_PROXY": "localhost,127.0.0.1,::1",
+        "no_proxy": "localhost,127.0.0.1,::1",
+    }
+    return config_path, environment
+
+
+def write_opencode_profile(
+    workspace: Path,
+    runtime: Path,
+    run_dir: Path,
+    executable: Path,
+    ollama_host: str,
+) -> Path:
+    """Deny OpenCode access outside its sanitized workspace and runtime."""
+    workspace = workspace.resolve(strict=True)
+    runtime = runtime.resolve(strict=True)
+    run_dir = run_dir.resolve(strict=True)
+    executable = executable.resolve(strict=True)
+    ollama_remote = ollama_seatbelt_remote(ollama_host)
+    allowed_reads = [
+        workspace,
+        runtime,
+        run_dir,
+        executable,
+        executable.parent,
+        Path("/System"),
+        Path("/usr"),
+        Path("/bin"),
+        Path("/sbin"),
+        Path("/Library"),
+        Path("/Applications"),
+        Path("/opt/homebrew"),
+        Path("/private/var/select"),
+        *user_toolchain_read_roots(Path.home()),
+    ]
+    lines = [
+        "(version 1)",
+        "(deny default)",
+        '(import "system.sb")',
+        "(allow process*)",
+        "(allow sysctl-read)",
+        # The Agent has no web/MCP tools. Its process may contact only the one
+        # configured loopback Ollama endpoint; all other local and non-local
+        # network destinations remain denied.
+        f'(allow network-outbound (remote ip "{ollama_remote}"))',
+        f'(allow file-write* (subpath "{seatbelt_escape(workspace)}"))',
+        f'(allow file-write* (subpath "{seatbelt_escape(runtime)}"))',
+    ]
+    lines.extend(
+        f'(allow file-read* (subpath "{seatbelt_escape(path)}"))'
+        for path in allowed_reads
+        if path.is_dir()
+    )
+    lines.extend(
+        f'(allow file-read* (literal "{seatbelt_escape(path)}"))'
+        for path in allowed_reads
+        if path.exists()
+    )
+    ancestors = {
+        parent
+        for path in allowed_reads
+        if path.exists()
+        for parent in path.resolve().parents
+    }
+    lines.extend(
+        f'(allow file-read* (literal "{seatbelt_escape(path)}"))'
+        for path in sorted(ancestors, key=str)
+    )
+    lines.extend(
+        (
+            f'(deny file-read* (subpath "{seatbelt_escape(workspace / ".git")}"))',
+            f'(deny file-write* (subpath "{seatbelt_escape(workspace / ".git")}"))',
+            f'(deny file-read* (literal "{seatbelt_escape(workspace / "opencode.json")}"))',
+            f'(deny file-write* (literal "{seatbelt_escape(workspace / "opencode.json")}"))',
+            f'(deny file-read* (literal "{seatbelt_escape(workspace / "opencode.jsonc")}"))',
+            f'(deny file-write* (literal "{seatbelt_escape(workspace / "opencode.jsonc")}"))',
+            f'(deny file-read* (subpath "{seatbelt_escape(workspace / ".opencode")}"))',
+            f'(deny file-write* (subpath "{seatbelt_escape(workspace / ".opencode")}"))',
+        )
+    )
+    lines.extend(
+        f'(deny file-read* (regex #"{pattern}"))'
+        for pattern in project_secret_regexes(workspace)
+    )
+    lines.extend(
+        f'(deny file-write* (regex #"{pattern}"))'
+        for pattern in project_secret_regexes(workspace)
+    )
+    profile = run_dir / "opencode.sb"
+    atomic_write_text(profile, "\n".join(lines) + "\n")
+    return profile
+
+
+def opencode_output_metadata(output: str) -> tuple[str, str]:
+    sessions: set[str] = set()
+    final_text = ""
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        session = event.get("sessionID")
+        if isinstance(session, str) and session:
+            sessions.add(session)
+        part = event.get("part")
+        if event.get("type") == "text" and isinstance(part, dict):
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                final_text = text
+    if len(sessions) != 1:
+        raise StructuredResultError("OpenCode 输出必须包含唯一 Session ID")
+    if not final_text.strip():
+        raise StructuredResultError("OpenCode 输出缺少最终文本摘要")
+    return next(iter(sessions)), final_text
+
+
 def make_run_dir(project: Path) -> Path:
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     digest = hashlib.sha256(str(project).encode()).hexdigest()[:8]
@@ -3199,6 +4012,106 @@ def make_run_dir(project: Path) -> Path:
     return path
 
 
+def call_opencode_coder(
+    settings: Settings,
+    project: Path,
+    model: str,
+    prompt: str,
+    run_dir: Path,
+    stage: str,
+    *,
+    risk: dict[str, Any],
+    session_id: str | None = None,
+    live: bool = False,
+    run_date: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    ensure_opencode_available(settings)
+    config_path, environment = prepare_opencode_runtime(
+        settings, project, model, run_dir, risk=risk, run_date=run_date
+    )
+    executable_value = shutil.which(settings.opencode_command)
+    if not executable_value:
+        raise WorkflowError("OpenCode 可执行文件在能力预检后消失")
+    executable = Path(executable_value)
+    profile = write_opencode_profile(
+        project,
+        config_path.parent.parent.parent,
+        run_dir,
+        executable,
+        settings.ollama_host,
+    )
+    # subprocess cwd does not rewrite an inherited PWD. OpenCode consults PWD
+    # while resolving its workspace, so retain the sanitized implementation
+    # directory rather than leaking the frontend Agent's repository path.
+    environment = {
+        **environment,
+        "PWD": str(project.resolve()),
+        "OLDPWD": str(project.resolve()),
+    }
+    runtime = config_path.parent.parent.parent
+    # ``opencode run`` documents ``--file`` as its non-positional task input.
+    # Store the complete prompt in the private runtime only for the duration
+    # of this child invocation; argv contains a fixed, non-sensitive cue so
+    # process inspection and timeout/watchdog evidence cannot expose the
+    # approved plan or capsule body.
+    prompt_path = runtime / "tmp" / f"{stage}-approved-prompt.md"
+    atomic_write_text(prompt_path, prompt)
+    command = [
+        "sandbox-exec",
+        "-f",
+        str(profile),
+        str(executable),
+        "run",
+        "--pure",
+        "--format",
+        "json",
+        "--model",
+        f"ollama/{model}",
+        "--agent",
+        settings.opencode_agent,
+        "--dir",
+        str(project),
+        "--file",
+        str(prompt_path),
+        "--title",
+        f"Local AI MVP Builder {stage}",
+    ]
+    if session_id:
+        command.extend(["--session", session_id])
+    # Keep the only positional message last. This avoids relying on argument
+    # parsing behavior for options placed after a positional message when the
+    # focused fixer resumes an OpenCode Session.
+    command.append("Read the attached approved task and implement it within its stated scope.")
+    logged_command = list(command)
+    try:
+        result = run_command(
+            command,
+            cwd=project,
+            timeout=settings.coder_timeout_seconds,
+            stdin_text=None,
+            log_path=run_dir / f"{stage}.log",
+            live=live,
+            monitor=True,
+            live_channel="OPENCODE",
+            json_events=True,
+            idle_timeout=settings.local_stall_timeout_seconds,
+            extra_env=environment,
+            command_for_log=logged_command,
+            clean_environment=True,
+        )
+    finally:
+        prompt_path.unlink(missing_ok=True)
+    actual_session, final_text = opencode_output_metadata(result.stdout or "")
+    if session_id and actual_session != session_id:
+        raise StructuredResultError("OpenCode fixer 未续接批准 Session")
+    atomic_write_text(
+        run_dir / f"{stage}-last-message.txt",
+        redact_persistent_output(final_text),
+    )
+    setattr(result, "session_id", actual_session)
+    return result
+
+
 def call_local_coder(
     settings: Settings,
     project: Path,
@@ -3207,7 +4120,27 @@ def call_local_coder(
     run_dir: Path,
     stage: str,
     live: bool = False,
+    *,
+    backend: str = "codex-ollama",
+    risk: dict[str, Any] | None = None,
+    session_id: str | None = None,
+    run_date: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if backend == "opencode":
+        return call_opencode_coder(
+            settings,
+            project,
+            model,
+            prompt,
+            run_dir,
+            stage,
+            risk=risk or {"classification": "low"},
+            session_id=session_id,
+            live=live,
+            run_date=run_date,
+        )
+    if backend != "codex-ollama":
+        raise WorkflowError(f"未知本地后端：{backend}")
     last_message = run_dir / f"{stage}-last-message.txt"
     command = [
         settings.codex_command,
@@ -3552,7 +4485,25 @@ def command_doctor(args: argparse.Namespace) -> int:
         risk = parse_risk_classification(
             plan_path.read_text(encoding="utf-8")
         )
-    local_model_required = not risk or risk["classification"] != "high"
+    # Older Python callers constructed a minimal Namespace before the backend
+    # selector existed. Keep that programmatic surface pinned to the former
+    # Codex/Ollama path; every current CLI parser exposes the option and thus
+    # follows the configured OpenCode default.
+    local_backend = (
+        getattr(args, "local_backend", None) or settings.local_backend
+        if hasattr(args, "local_backend")
+        else "codex-ollama"
+    )
+    if local_backend not in {"opencode", "codex-ollama"}:
+        raise WorkflowError("local.backend 必须是 opencode 或 codex-ollama")
+    opencode_control_plan = bool(
+        plan_value
+        and local_backend == "opencode"
+        and plan_declares_opencode_project_controls(Path.cwd(), plan_path)
+    )
+    local_model_required = not risk or (
+        risk["classification"] != "high" and not opencode_control_plan
+    )
     checks = {
         "codex": shutil.which(settings.codex_command),
         "sandbox_exec": shutil.which("sandbox-exec"),
@@ -3560,11 +4511,23 @@ def command_doctor(args: argparse.Namespace) -> int:
         "git": shutil.which("git"),
         "risk": risk,
         "local_model_required": local_model_required,
+        "local_backend": local_backend,
+        "opencode_control_plan": opencode_control_plan,
     }
     required = ["codex", "sandbox_exec", "git"]
     if local_model_required:
         checks["ollama"] = shutil.which("ollama")
         required.append("ollama")
+        if local_backend == "opencode":
+            checks["opencode"] = opencode_capability_probe(settings)
+            checks["opencode_available"] = checks["opencode"]["status"] == "passed"
+            required.append("opencode_available")
+            # Never probe an arbitrary endpoint merely to report that the
+            # OpenCode route would reject it. The capability probe validates
+            # loopback syntax before any Ollama HTTP request.
+            if checks["opencode"].get("ollama_endpoint_loopback") is False:
+                print(json.dumps(checks, ensure_ascii=False, indent=2))
+                return 1
         if checks["ollama"]:
             models = sorted(ollama_models(settings.ollama_host))
             selected_model = model_id(model_alias)
@@ -3655,12 +4618,27 @@ def command_run(args: argparse.Namespace) -> int:
 
 def _command_run_locked(args: argparse.Namespace) -> int:
     settings = load_settings()
+    if bool(getattr(args, "allow_dirty", False)):
+        raise WorkflowError("受监督工作流不允许 --allow-dirty")
+    local_backend = (
+        getattr(args, "local_backend", None) or settings.local_backend
+        if hasattr(args, "local_backend")
+        else "codex-ollama"
+    )
     live = bool(getattr(args, "live", False))
     rounds = settings.max_local_review_rounds
     if rounds < 1 or rounds > 2:
         raise WorkflowError("workflow.max_local_review_rounds 必须在 1 到 2 之间")
     if settings.strategy not in {"adaptive", "legacy"}:
         raise WorkflowError("workflow.strategy 必须是 adaptive 或 legacy")
+    if local_backend not in {"opencode", "codex-ollama"}:
+        raise WorkflowError("local.backend 必须是 opencode 或 codex-ollama")
+    if not 0.0 <= settings.opencode_temperature <= 0.3:
+        raise WorkflowError("local.opencode_temperature 必须在 0.0 到 0.3 之间")
+    if not 1 <= settings.opencode_low_max_steps <= 32:
+        raise WorkflowError("local.opencode_low_max_steps 必须在 1 到 32 之间")
+    if not 1 <= settings.opencode_medium_max_steps <= 32:
+        raise WorkflowError("local.opencode_medium_max_steps 必须在 1 到 32 之间")
     if settings.severe_finding_threshold < 1:
         raise WorkflowError("workflow.severe_finding_threshold 必须是正整数")
     if settings.context_capsule_max_bytes < 1024:
@@ -3673,6 +4651,7 @@ def _command_run_locked(args: argparse.Namespace) -> int:
     ):
         raise WorkflowError("cloud.soft_token_budget 必须是正整数或 0")
     project = Path(args.project).expanduser().resolve()
+    target_project = project
     plan_path = Path(args.plan).expanduser().resolve()
     if not plan_path.is_file():
         raise WorkflowError(f"计划文件不存在：{plan_path}")
@@ -3680,7 +4659,7 @@ def _command_run_locked(args: argparse.Namespace) -> int:
     approved_plan_sha256 = hashlib.sha256(plan.encode("utf-8")).hexdigest()
     risk = parse_risk_classification(plan)
     model = model_id(args.model)
-    validate_project(project, settings.require_clean_worktree and not args.allow_dirty)
+    validate_project(project, settings.require_clean_worktree)
     commands = load_validation_commands(project)
     if not commands:
         raise WorkflowError(
@@ -3694,19 +4673,25 @@ def _command_run_locked(args: argparse.Namespace) -> int:
     # clean gate and preflight. Some unit fixtures inject an in-project run_dir;
     # snapshot after those fixture-owned writes to avoid a false positive.
     if not run_dir.resolve().is_relative_to(project):
-        validate_project(
-            project, settings.require_clean_worktree and not args.allow_dirty
-        )
+        validate_project(project, settings.require_clean_worktree)
     initial_project_snapshot, commands = freeze_project_preflight_state(project)
     if not commands:
         raise WorkflowError(
             ".mvp-ai.toml 必须至少配置一条 validation.commands，不能在无验证条件下运行"
         )
+    opencode_control_plan = (
+        local_backend == "opencode"
+        and plan_declares_opencode_project_controls(target_project, stored_plan)
+    )
     today = dt.date.today().isoformat()
     all_validations: list[dict[str, Any]] = []
     latest_validations: list[dict[str, Any]] = []
     latest_review: dict[str, Any] | None = None
     usage_stages: list[dict[str, Any]] = []
+    opencode_session_id: str | None = None
+    implementation_container: Path | None = None
+    implementation_project: Path | None = None
+    implementation_promoted = False
     review_history: list[tuple[str, dict[str, Any]]] = []
     capsules: list[dict[str, Any]] = []
     preflight: list[dict[str, Any]] = []
@@ -3721,9 +4706,18 @@ def _command_run_locked(args: argparse.Namespace) -> int:
         "failure_classification": None,
         "risk_route": (
             "direct-cloud"
-            if risk["classification"] == "high"
+            if risk["classification"] == "high" or opencode_control_plan
             else "local-first"
         ),
+        "local_backend": local_backend,
+        "local_session_id": None,
+        "implementation_workspace": {
+            "used": False,
+            "promoted": False,
+            "changed_files": 0,
+            "backup_cleanup_pending": False,
+            "backup_cleanup_warning": None,
+        },
         "approved_plan": {
             "source_path": str(plan_path),
             "sha256": approved_plan_sha256,
@@ -3749,6 +4743,25 @@ def _command_run_locked(args: argparse.Namespace) -> int:
             "settings": settings,
         }
 
+    def cleanup_implementation() -> None:
+        nonlocal implementation_container, implementation_project
+        if implementation_container is None:
+            return
+        cleanup_baseline_workspace(implementation_container)
+        implementation_container = None
+        implementation_project = None
+
+    def finish(code: int) -> int:
+        cleanup_implementation()
+        if (
+            workflow["implementation_workspace"]["used"]
+            and not implementation_promoted
+        ):
+            verify_project_integrity_snapshot(
+                target_project, initial_project_snapshot
+            )
+        return code
+
     def guarded(action):
         try:
             return action()
@@ -3761,9 +4774,10 @@ def _command_run_locked(args: argparse.Namespace) -> int:
                 "failure_classification"
             ):
                 workflow["failure_classification"] = "project_changed_after_validation"
+            cleanup_implementation()
             write_failure_summary(
                 run_dir,
-                project=project,
+                project=target_project,
                 model=model,
                 error=exc,
                 review=latest_review,
@@ -3815,6 +4829,7 @@ def _command_run_locked(args: argparse.Namespace) -> int:
                 review=review,
                 project_snapshot=project_snapshot,
                 max_bytes=settings.context_capsule_max_bytes,
+                run_date=today,
             )
             verify_context_capsule(path)
             verify_approved_plan()
@@ -3837,7 +4852,7 @@ def _command_run_locked(args: argparse.Namespace) -> int:
         if not usage_stages and not run_dir.resolve().is_relative_to(project):
             try:
                 verify_project_integrity_snapshot(
-                    project, initial_project_snapshot
+                    target_project, initial_project_snapshot
                 )
             except Exception:
                 workflow["failure_classification"] = (
@@ -3972,23 +4987,78 @@ def _command_run_locked(args: argparse.Namespace) -> int:
     def write_ready_handoff(
         review_payload: dict[str, Any], label: str
     ) -> None:
+        nonlocal implementation_promoted
         expected = review_snapshots[label]
         enforce = not run_dir.resolve().is_relative_to(project)
         try:
             if enforce:
                 verify_project_content_snapshot(project, expected)
+            handoff_snapshot = expected
+            if implementation_project is not None:
+                def validate_promotion_candidate(
+                    candidate: Path,
+                ) -> list[dict[str, Any]]:
+                    outcomes = run_validations(
+                        candidate,
+                        load_validation_commands(candidate),
+                        run_dir,
+                        "promotion-candidate",
+                        live=live,
+                    )
+                    documentation = validate_development_documents(
+                        candidate,
+                        run_dir,
+                        "promotion-candidate",
+                        today,
+                    )
+                    outcomes.append(documentation)
+                    all_validations.extend(outcomes)
+                    if not validations_passed(outcomes):
+                        raise WorkflowError("事务式回写候选验证未通过")
+                    return outcomes
+
+                (
+                    changed,
+                    _candidate_validations,
+                    backup_cleanup_warning,
+                ) = promote_implementation_workspace(
+                    implementation_project,
+                    target_project,
+                    run_dir,
+                    stored_plan,
+                    initial_project_snapshot,
+                    validate_promotion_candidate,
+                    run_date=today,
+                )
+                implementation_promoted = True
+                workflow["implementation_workspace"].update(
+                    {
+                        "promoted": True,
+                        "changed_files": len(changed),
+                        "backup_cleanup_pending": bool(backup_cleanup_warning),
+                        "backup_cleanup_warning": backup_cleanup_warning,
+                    }
+                )
+                # The target and candidate have different Git HEAD values,
+                # but their reviewed staged/unstaged/untracked content must
+                # match exactly.  This catches an unrelated concurrent target
+                # edit after the per-file preimage checks but before handoff.
+                handoff_snapshot = promoted_target_content_snapshot(
+                    target_project, expected
+                )
+                cleanup_implementation()
             write_summary(
                 run_dir,
-                project=project,
+                project=target_project,
                 model=model,
                 status="ready_for_user_review",
                 review=review_payload,
                 validations=all_validations,
-                handoff_snapshot={"sha256": expected["sha256"]},
+                handoff_snapshot={"sha256": handoff_snapshot["sha256"]},
                 **summary_kwargs(),
             )
-            if enforce:
-                verify_project_content_snapshot(project, expected)
+            if implementation_promoted or enforce:
+                verify_project_content_snapshot(target_project, handoff_snapshot)
         except ProjectChangedError:
             workflow["failure_classification"] = "project_changed_during_handoff"
             raise
@@ -4007,7 +5077,7 @@ def _command_run_locked(args: argparse.Namespace) -> int:
             )
             write_failure_summary(
                 run_dir,
-                project=project,
+                project=target_project,
                 model=model,
                 error=WorkflowError(
                     "云端调用额度不足以同时完成 supervisor 与强制 final review"
@@ -4017,7 +5087,7 @@ def _command_run_locked(args: argparse.Namespace) -> int:
                 **summary_kwargs(),
             )
             print("BLOCKED：云端调用上限未预留 supervisor + final review 容量。")
-            return 2
+            return finish(2)
         if reason == "risk_high_direct_cloud":
             takeover_classification = "risk"
         elif reason.startswith("adaptive_") or reason.startswith("第二轮"):
@@ -4092,7 +5162,7 @@ def _command_run_locked(args: argparse.Namespace) -> int:
             )
             write_failure_summary(
                 run_dir,
-                project=project,
+                project=target_project,
                 model=model,
                 error=WorkflowError("Codex 接管后项目验证未通过"),
                 review=review_payload,
@@ -4100,7 +5170,7 @@ def _command_run_locked(args: argparse.Namespace) -> int:
                 **summary_kwargs(),
             )
             print("BLOCKED：Codex 接管后验证未通过，未消耗最终 Review 调用。")
-            return 2
+            return finish(2)
         final_review = guarded(lambda: cloud_review(latest_validations, "final-review"))
         if live:
             emit_progress(
@@ -4112,7 +5182,7 @@ def _command_run_locked(args: argparse.Namespace) -> int:
             workflow["failure_classification"] = "final_review_findings"
             write_summary(
                 run_dir,
-                project=project,
+                project=target_project,
                 model=model,
                 status="needs_manual_attention",
                 review=final_review,
@@ -4123,11 +5193,13 @@ def _command_run_locked(args: argparse.Namespace) -> int:
             guarded(lambda: write_ready_handoff(final_review, "final-review"))
         if final_review["verdict"] == "pass":
             print("PASS：Codex 接管后通过验证与最终评审，等待用户评审。")
-            return 0
+            return finish(0)
         print("BLOCKED：Codex 接管后仍有问题，需要当前任务继续处理。")
-        return 2
+        return finish(2)
 
-    minimum_cloud_calls = 2 if risk["classification"] == "high" else 3
+    minimum_cloud_calls = (
+        2 if risk["classification"] == "high" or opencode_control_plan else 3
+    )
     if settings.cloud_max_calls_per_run < minimum_cloud_calls:
         workflow["failure_classification"] = "cloud_call_limit_configuration"
         preflight.append(
@@ -4141,7 +5213,7 @@ def _command_run_locked(args: argparse.Namespace) -> int:
         )
         write_failure_summary(
             run_dir,
-            project=project,
+            project=target_project,
             model=model,
             error=WorkflowError(
                 "cloud.max_calls_per_run 不足以保留 supervisor + final review"
@@ -4150,7 +5222,7 @@ def _command_run_locked(args: argparse.Namespace) -> int:
             validations=all_validations,
             **summary_kwargs(),
         )
-        return 2
+        return finish(2)
 
     print(f"run_dir={run_dir}")
     print(f"model={model}")
@@ -4172,7 +5244,11 @@ def _command_run_locked(args: argparse.Namespace) -> int:
                 "classification": None,
             }
         )
-        if risk["classification"] != "high":
+        if risk["classification"] != "high" and not opencode_control_plan:
+            if local_backend == "opencode":
+                preflight_stage = "opencode-capability"
+                opencode_probe = ensure_opencode_available(settings)
+                preflight.append(opencode_probe)
             preflight_stage = "local-model"
             ensure_model_available(model, settings.ollama_host)
         preflight_stage = "baseline-copy"
@@ -4220,14 +5296,14 @@ def _command_run_locked(args: argparse.Namespace) -> int:
             workflow["failure_classification"] = failure_class
             write_failure_summary(
                 run_dir,
-                project=project,
+                project=target_project,
                 model=model,
                 error=WorkflowError("干净基线验证未通过，未启动任何模型"),
                 review=None,
                 validations=all_validations,
                 **summary_kwargs(),
             )
-            return 2
+            return finish(2)
     except Exception as exc:
         failure_stage = preflight_stage
         if isinstance(exc, BaselineCleanupError):
@@ -4272,6 +5348,65 @@ def _command_run_locked(args: argparse.Namespace) -> int:
         }
         return supervisor_takeover(risk_review, "risk_high_direct_cloud")
 
+    # Repository-local OpenCode control files are deliberately absent from a
+    # local candidate. If the approved plan needs to change them, send the
+    # entire task to the cloud supervisor while it still operates on the real
+    # target rather than creating a candidate that cannot complete the scope.
+    if opencode_control_plan:
+        control_review = {
+            "verdict": "fail",
+            "summary": "计划包含 OpenCode 项目控制文件，改由云端监督者直接实现。",
+            "findings": [],
+            "tests": [],
+        }
+        return supervisor_takeover(
+            control_review, "opencode_project_control_direct_cloud"
+        )
+
+    if local_backend == "opencode":
+        try:
+            verify_project_integrity_snapshot(
+                target_project, initial_project_snapshot
+            )
+            implementation_container, implementation_project = (
+                make_disposable_baseline_workspace(
+                    target_project,
+                    run_dir,
+                    exclude_opencode_project_controls=True,
+                )
+            )
+            project = implementation_project
+            workflow["implementation_workspace"]["used"] = True
+            preflight.append(
+                {
+                    "stage": "implementation-workspace",
+                    "status": "passed",
+                    "classification": None,
+                    "sanitized": True,
+                    "target_writable_by_local_agent": False,
+                }
+            )
+        except Exception as exc:
+            workflow["failure_classification"] = "implementation_workspace_failure"
+            preflight.append(
+                {
+                    "stage": "implementation-workspace",
+                    "status": "failed",
+                    "classification": "implementation_workspace_failure",
+                    "error": redact_live_text(str(exc)),
+                }
+            )
+            write_failure_summary(
+                run_dir,
+                project=target_project,
+                model=model,
+                error=exc,
+                review=None,
+                validations=all_validations,
+                **summary_kwargs(),
+            )
+            return finish(2)
+
     def prepare_local_prompt(
         template: str, classification: str, **values: str
     ) -> str:
@@ -4287,7 +5422,7 @@ def _command_run_locked(args: argparse.Namespace) -> int:
         )
     )
     try:
-        tracked_agent(
+        local_coder_result = tracked_agent(
             stage="coder-initial",
             backend="local",
             role="coder",
@@ -4300,21 +5435,29 @@ def _command_run_locked(args: argparse.Namespace) -> int:
                 run_dir,
                 "coder-initial",
                 live=live,
+                backend=local_backend,
+                risk=risk,
+                run_date=today,
             ),
         )
+        if local_backend == "opencode":
+            opencode_session_id = getattr(local_coder_result, "session_id", None)
+            if not isinstance(opencode_session_id, str) or not opencode_session_id:
+                raise StructuredResultError("OpenCode coder 缺少 Session ID")
+            workflow["local_session_id"] = opencode_session_id
     except (ProjectChangedError, EvidenceRedactionError) as exc:
         if isinstance(exc, EvidenceRedactionError):
             workflow["failure_classification"] = "evidence_redaction_failure"
         write_failure_summary(
             run_dir,
-            project=project,
+            project=target_project,
             model=model,
             error=exc,
             review=None,
             validations=all_validations,
             **summary_kwargs(),
         )
-        return 2
+        return finish(2)
     except Exception as exc:
         return supervisor_takeover(
             watchdog_review(run_dir, "coder-initial", exc),
@@ -4331,14 +5474,14 @@ def _command_run_locked(args: argparse.Namespace) -> int:
             workflow["failure_classification"] = "environment_validation"
             write_failure_summary(
                 run_dir,
-                project=project,
+                project=target_project,
                 model=model,
                 error=WorkflowError("编码后出现确定性验证环境问题"),
                 review=None,
                 validations=all_validations,
                 **summary_kwargs(),
             )
-            return 2
+            return finish(2)
         fix_capsule = guarded(
             lambda: capsule("validation-fix", latest_validations)
         )
@@ -4352,7 +5495,7 @@ def _command_run_locked(args: argparse.Namespace) -> int:
             )
         )
         try:
-            tracked_agent(
+            validation_fix_result = tracked_agent(
                 stage="validation-fix",
                 backend="local",
                 role="fixer",
@@ -4365,8 +5508,16 @@ def _command_run_locked(args: argparse.Namespace) -> int:
                     run_dir,
                     "validation-fix",
                     live=live,
+                    backend=local_backend,
+                    risk=risk,
+                    session_id=opencode_session_id,
+                    run_date=today,
                 ),
             )
+            if local_backend == "opencode" and getattr(
+                validation_fix_result, "session_id", None
+            ) != opencode_session_id:
+                raise StructuredResultError("OpenCode validation fixer Session 不一致")
         except (EvidenceRedactionError, ProjectChangedError) as exc:
             workflow["failure_classification"] = (
                 "evidence_redaction_failure"
@@ -4375,14 +5526,14 @@ def _command_run_locked(args: argparse.Namespace) -> int:
             )
             write_failure_summary(
                 run_dir,
-                project=project,
+                project=target_project,
                 model=model,
                 error=exc,
                 review=None,
                 validations=all_validations,
                 **summary_kwargs(),
             )
-            return 2
+            return finish(2)
         except Exception as exc:
             return supervisor_takeover(
                 watchdog_review(run_dir, "validation-fix", exc),
@@ -4397,14 +5548,14 @@ def _command_run_locked(args: argparse.Namespace) -> int:
                 workflow["failure_classification"] = "environment_validation"
                 write_failure_summary(
                     run_dir,
-                    project=project,
+                    project=target_project,
                     model=model,
                     error=WorkflowError("确定性验证环境问题仍存在"),
                     review=None,
                     validations=all_validations,
                     **summary_kwargs(),
                 )
-                return 2
+                return finish(2)
             return supervisor_takeover(
                 {
                     "verdict": "fail",
@@ -4434,7 +5585,7 @@ def _command_run_locked(args: argparse.Namespace) -> int:
                 )
             )
             print("PASS：已通过独立 Code Review，等待用户评审。")
-            return 0
+            return finish(0)
         action = (
             "local_fix"
             if settings.strategy == "legacy" and round_number < rounds
@@ -4477,7 +5628,7 @@ def _command_run_locked(args: argparse.Namespace) -> int:
                 )
             )
             try:
-                tracked_agent(
+                review_fix_result = tracked_agent(
                     stage=f"local-fix-{round_number}",
                     backend="local",
                     role="fixer",
@@ -4490,8 +5641,16 @@ def _command_run_locked(args: argparse.Namespace) -> int:
                         run_dir,
                         f"local-fix-{round_number}",
                         live=live,
+                        backend=local_backend,
+                        risk=risk,
+                        session_id=opencode_session_id,
+                        run_date=today,
                     ),
                 )
+                if local_backend == "opencode" and getattr(
+                    review_fix_result, "session_id", None
+                ) != opencode_session_id:
+                    raise StructuredResultError("OpenCode review fixer Session 不一致")
             except (EvidenceRedactionError, ProjectChangedError) as exc:
                 workflow["failure_classification"] = (
                     "evidence_redaction_failure"
@@ -4500,14 +5659,14 @@ def _command_run_locked(args: argparse.Namespace) -> int:
                 )
                 write_failure_summary(
                     run_dir,
-                    project=project,
+                    project=target_project,
                     model=model,
                     error=exc,
                     review=latest_review,
                     validations=all_validations,
                     **summary_kwargs(),
                 )
-                return 2
+                return finish(2)
             except Exception as exc:
                 return supervisor_takeover(
                     watchdog_review(
@@ -4526,7 +5685,7 @@ def _command_run_locked(args: argparse.Namespace) -> int:
                     workflow["failure_classification"] = "environment_validation"
                     write_failure_summary(
                         run_dir,
-                        project=project,
+                        project=target_project,
                         model=model,
                         error=WorkflowError(
                             "局部修复后出现确定性验证环境问题"
@@ -4535,7 +5694,7 @@ def _command_run_locked(args: argparse.Namespace) -> int:
                         validations=all_validations,
                         **summary_kwargs(),
                     )
-                    return 2
+                    return finish(2)
                 return supervisor_takeover(
                     latest_review,
                     "local_fix_validation_failed",
@@ -4554,6 +5713,11 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser("doctor", help="检查 Codex、Ollama、Git 与本地模型")
     doctor.add_argument("--plan", help="按计划风险决定是否需要本地模型")
     doctor.add_argument("--model", default="primary", help="本地模型别名或 ID")
+    doctor.add_argument(
+        "--local-backend",
+        choices=("opencode", "codex-ollama"),
+        help="本地 Agent 后端；默认读取 config/defaults.toml",
+    )
     doctor.set_defaults(func=command_doctor)
 
     check_config = subparsers.add_parser(
@@ -4570,7 +5734,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--project", required=True)
     run.add_argument("--plan", required=True)
     run.add_argument("--model", default="primary", help="模型别名或 Ollama 模型 ID")
-    run.add_argument("--allow-dirty", action="store_true")
+    run.add_argument(
+        "--local-backend",
+        choices=("opencode", "codex-ollama"),
+        help="本地 Agent 后端；默认使用 OpenCode",
+    )
     run.add_argument(
         "--live",
         action="store_true",

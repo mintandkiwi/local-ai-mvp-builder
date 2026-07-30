@@ -2199,6 +2199,34 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(json_event["metadata"]["api_key"], "[REDACTED]")
 
     @mock.patch.object(MODULE.subprocess, "run")
+    def test_clean_local_agent_environment_excludes_host_credentials(self, subprocess_run):
+        subprocess_run.return_value = SimpleNamespace(returncode=0, stdout="")
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "API_TOKEN": "must-not-reach-opencode",
+                    "AWS_SECRET_ACCESS_KEY": "must-not-reach-opencode",
+                    "HTTPS_PROXY": "http://private-proxy.invalid",
+                },
+                clear=False,
+            ):
+                MODULE.run_command(
+                    ["local-agent"],
+                    cwd=Path(directory),
+                    timeout=1,
+                    stdin_text=None,
+                    log_path=Path(directory) / "local-agent.log",
+                    clean_environment=True,
+                )
+        env = subprocess_run.call_args.kwargs["env"]
+        self.assertNotIn("API_TOKEN", env)
+        self.assertNotIn("AWS_SECRET_ACCESS_KEY", env)
+        self.assertNotIn("HTTPS_PROXY", env)
+        self.assertIn("PATH", env)
+        self.assertEqual(env["NO_PROXY"], "localhost,127.0.0.1,::1")
+
+    @mock.patch.object(MODULE.subprocess, "run")
     def test_command_log_redacts_malformed_sensitive_subtree(self, subprocess_run):
         subprocess_run.return_value = SimpleNamespace(
             returncode=0,
@@ -3089,6 +3117,49 @@ class OrchestratorTests(unittest.TestCase):
                 second = MODULE.project_content_snapshot(project)
             self.assertNotEqual(first["sha256"], second["sha256"])
 
+    def test_promoted_target_snapshot_rejects_unreviewed_concurrent_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            run_dir = root / "run"
+            target.mkdir()
+            run_dir.mkdir()
+            (target / "src").mkdir()
+            app = target / "src/app.py"
+            other = target / "src/other.py"
+            app.write_text("before\n", encoding="utf-8")
+            other.write_text("stable\n", encoding="utf-8")
+            (target / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["true"]\n', encoding="utf-8"
+            )
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=target, check=True)
+            subprocess.run(
+                [
+                    "git", "-c", "user.name=Test", "-c",
+                    "user.email=test@example.invalid", "commit", "-qm", "base",
+                ],
+                cwd=target,
+                check=True,
+            )
+            container, candidate = MODULE.make_disposable_baseline_workspace(
+                target, run_dir
+            )
+            try:
+                (candidate / "src/app.py").write_text(
+                    "reviewed\n", encoding="utf-8"
+                )
+                expected = MODULE.project_content_snapshot(candidate)
+                app.write_text("reviewed\n", encoding="utf-8")
+                handoff = MODULE.promoted_target_content_snapshot(target, expected)
+                self.assertEqual(handoff["sha256"], expected["sha256"])
+
+                other.write_text("concurrent unreviewed\n", encoding="utf-8")
+                with self.assertRaisesRegex(MODULE.ProjectChangedError, "未评审"):
+                    MODULE.promoted_target_content_snapshot(target, expected)
+            finally:
+                MODULE.cleanup_baseline_workspace(container)
+
     def test_review_snapshot_change_blocks_normal_and_final_ready_paths(self):
         cases = [
             (risk, phase, index)
@@ -3549,19 +3620,36 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_cli_does_not_allow_shortening_review_protocol(self):
         parser = MODULE.build_parser()
-        with contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit):
+        rejected_arguments = (
+            [
+                "run",
+                "--project",
+                "/tmp/project",
+                "--plan",
+                "/tmp/plan.md",
+                "--max-local-reviews",
+                "1",
+            ],
+            [
+                "run",
+                "--project",
+                "/tmp/project",
+                "--plan",
+                "/tmp/plan.md",
+                "--allow-dirty",
+            ],
+        )
+        for arguments in rejected_arguments:
+            with self.subTest(arguments=arguments), contextlib.redirect_stderr(
+                io.StringIO()
+            ), self.assertRaises(SystemExit):
                 parser.parse_args(
-                    [
-                        "run",
-                        "--project",
-                        "/tmp/project",
-                        "--plan",
-                        "/tmp/plan.md",
-                        "--max-local-reviews",
-                        "1",
-                    ]
+                    arguments
                 )
+
+    def test_orchestrator_rejects_programmatic_allow_dirty_bypass(self):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "不允许 --allow-dirty"):
+            MODULE._command_run_locked(SimpleNamespace(allow_dirty=True))
 
     @mock.patch.object(MODULE, "write_summary")
     @mock.patch.object(MODULE, "call_supervisor")
@@ -4853,6 +4941,1136 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(stages[0]["stage"], "coder-initial")
         self.assertEqual(stages[0]["measurement"], "unavailable")
         self.assertEqual(stages[0]["exit_code"], 7)
+
+    def test_opencode_usage_sums_step_finish_events(self):
+        output = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "step_finish",
+                        "part": {
+                            "tokens": {
+                                "input": 11,
+                                "output": 7,
+                                "reasoning": 2,
+                                "total": 20,
+                                "cache": {"read": 3},
+                            }
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "step_finish",
+                        "part": {
+                            "tokens": {
+                                "input": 5,
+                                "output": 4,
+                                "reasoning": 1,
+                                "total": 10,
+                                "cache": {"read": 1},
+                            }
+                        },
+                    }
+                ),
+            ]
+        )
+
+        usage = MODULE.parse_token_usage(output)
+
+        self.assertEqual(usage["measurement"], "exact")
+        self.assertEqual(usage["input_tokens"], 16)
+        self.assertEqual(usage["cached_input_tokens"], 4)
+        self.assertEqual(usage["output_tokens"], 11)
+        self.assertEqual(usage["reasoning_output_tokens"], 3)
+        self.assertEqual(usage["total_tokens"], 30)
+
+    def test_opencode_usage_rejects_inconsistent_totals(self):
+        output = json.dumps(
+            {
+                "type": "step_finish",
+                "part": {
+                    "tokens": {
+                        "input": 9,
+                        "output": 4,
+                        "reasoning": 0,
+                        "total": 8,
+                        "cache": {"read": 0},
+                    }
+                },
+            }
+        )
+        self.assertEqual(
+            MODULE.parse_token_usage(output)["measurement"], "unavailable"
+        )
+
+    def test_opencode_usage_parses_persisted_format_json_command(self):
+        event = json.dumps(
+            {
+                "type": "step_finish",
+                "part": {
+                    "tokens": {
+                        "input": 8,
+                        "output": 3,
+                        "reasoning": 1,
+                        "total": 12,
+                        "cache": {"read": 0},
+                    }
+                },
+            }
+        )
+        usage = MODULE.parse_token_usage(
+            'command: ["opencode", "run", "--format", "json"]\n\n' + event
+        )
+        self.assertEqual(usage["measurement"], "exact")
+        self.assertEqual(usage["total_tokens"], 12)
+
+    def test_opencode_output_requires_one_session_and_final_text(self):
+        output = "\n".join(
+            [
+                json.dumps({"type": "step_start", "sessionID": "ses_1"}),
+                json.dumps(
+                    {
+                        "type": "text",
+                        "sessionID": "ses_1",
+                        "part": {"text": "完成最小修改"},
+                    }
+                ),
+            ]
+        )
+        self.assertEqual(
+            MODULE.opencode_output_metadata(output),
+            ("ses_1", "完成最小修改"),
+        )
+        with self.assertRaises(MODULE.StructuredResultError):
+            MODULE.opencode_output_metadata(
+                output + "\n" + json.dumps({"sessionID": "ses_2"})
+            )
+        with self.assertRaises(MODULE.StructuredResultError):
+            MODULE.opencode_output_metadata(
+                json.dumps({"type": "step_start", "sessionID": "ses_1"})
+            )
+
+    def test_opencode_capability_probe_checks_required_flags(self):
+        settings = replace(MODULE.load_settings(), opencode_command="opencode-test")
+        completed = subprocess.CompletedProcess(
+            ["opencode-test", "run", "--help"],
+            0,
+            stdout="--model --agent --format --session --dir --pure\n",
+            stderr=None,
+        )
+        with (
+            mock.patch.object(MODULE.shutil, "which", return_value="/bin/opencode"),
+            mock.patch.object(MODULE.subprocess, "run", return_value=completed),
+        ):
+            probe = MODULE.opencode_capability_probe(settings)
+        self.assertEqual(probe["status"], "passed")
+        self.assertEqual(probe["missing_flags"], [])
+
+        completed.stdout = "--model --format\n"
+        with (
+            mock.patch.object(MODULE.shutil, "which", return_value="/bin/opencode"),
+            mock.patch.object(MODULE.subprocess, "run", return_value=completed),
+        ):
+            probe = MODULE.opencode_capability_probe(settings)
+        self.assertEqual(probe["status"], "failed")
+        self.assertIn("--agent", probe["missing_flags"])
+
+    def test_opencode_requires_a_loopback_ollama_endpoint(self):
+        settings = replace(
+            MODULE.load_settings(),
+            opencode_command="opencode-test",
+            ollama_host="https://ollama.example.invalid",
+        )
+        with mock.patch.object(MODULE.shutil, "which", return_value="/bin/opencode"):
+            probe = MODULE.opencode_capability_probe(settings)
+        self.assertEqual(probe["status"], "failed")
+        self.assertFalse(probe["ollama_endpoint_loopback"])
+        self.assertIn("回环", probe["error"])
+        self.assertTrue(MODULE.is_loopback_ollama_endpoint("http://127.0.0.1:11434"))
+        self.assertTrue(MODULE.is_loopback_ollama_endpoint("http://[::1]:11434"))
+        self.assertFalse(MODULE.is_loopback_ollama_endpoint("http://10.0.0.2:11434"))
+        self.assertFalse(MODULE.is_loopback_ollama_endpoint("http://127.0.0.1:0"))
+        self.assertEqual(
+            MODULE.ollama_seatbelt_remote("http://127.0.0.1:11434"),
+            "localhost:11434",
+        )
+        self.assertEqual(
+            MODULE.ollama_seatbelt_remote("https://localhost"),
+            "localhost:443",
+        )
+        self.assertEqual(
+            MODULE.ollama_seatbelt_remote("http://[::1]:11434"),
+            "localhost:11434",
+        )
+
+    def test_opencode_doctor_rejects_remote_endpoint_without_ollama_probe(self):
+        settings = replace(
+            MODULE.load_settings(), ollama_host="https://ollama.example.invalid"
+        )
+        args = SimpleNamespace(model="primary", local_backend="opencode")
+        with (
+            mock.patch.object(MODULE, "load_settings", return_value=settings),
+            mock.patch.object(MODULE.shutil, "which", return_value="/bin/true"),
+            mock.patch.object(MODULE, "ollama_models") as model_probe,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(MODULE.command_doctor(args), 1)
+        model_probe.assert_not_called()
+
+    def test_opencode_doctor_skips_local_model_for_control_file_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = Path(directory) / "plan.md"
+            plan.write_text(
+                "# Plan\n\nRisk classification: low\n\n- Update `opencode.json`.\n",
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(
+                model="primary", local_backend="opencode", plan=str(plan)
+            )
+            with (
+                mock.patch.object(MODULE.shutil, "which", return_value="/bin/true"),
+                mock.patch.object(MODULE, "ollama_models") as model_probe,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(MODULE.command_doctor(args), 0)
+            model_probe.assert_not_called()
+
+    def test_prepare_opencode_runtime_is_private_and_deny_by_default(self):
+        settings = MODULE.load_settings()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            run_dir = root / "run"
+            project.mkdir()
+            run_dir.mkdir()
+            (project / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["python3 -m unittest"]\n',
+                encoding="utf-8",
+            )
+            (run_dir / "plan.md").write_text(
+                "# Plan\n\n- `src/app.py`\n", encoding="utf-8"
+            )
+
+            config_path, environment = MODULE.prepare_opencode_runtime(
+                settings,
+                project,
+                "test-model:latest",
+                run_dir,
+                risk={"classification": "low"},
+            )
+
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            agent = (
+                run_dir
+                / "opencode-runtime/config/opencode/agents/local-mvp-coder.md"
+            ).read_text(encoding="utf-8")
+            self.assertEqual(set(config["provider"]), {"ollama"})
+            self.assertEqual(config["mcp"], {})
+            self.assertIn('"*": deny', agent)
+            self.assertIn("  edit:\n    allow", agent)
+            self.assertIn('".git/**": deny', agent)
+            self.assertIn('"python3 -m unittest": allow', agent)
+            for key in (
+                "HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "XDG_CACHE_HOME",
+                "TMPDIR",
+                "OPENCODE_CONFIG",
+                "OPENCODE_CONFIG_DIR",
+            ):
+                self.assertTrue(
+                    Path(environment[key]).resolve().is_relative_to(
+                        (run_dir / "opencode-runtime").resolve()
+                    )
+                )
+            self.assertEqual(
+                (Path(environment["XDG_CONFIG_HOME"]) / "opencode/agents").resolve(),
+                (config_path.parent / "agents").resolve(),
+            )
+
+    def test_opencode_runtime_uses_effective_scalar_edit_permission(self):
+        settings = MODULE.load_settings()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            run_dir = root / "run"
+            project.mkdir()
+            run_dir.mkdir()
+            (project / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["true"]\n', encoding="utf-8"
+            )
+            (run_dir / "plan.md").write_text(
+                "# Plan\n\n- `src/app.py`\n", encoding="utf-8"
+            )
+            MODULE.prepare_opencode_runtime(
+                settings,
+                project,
+                "test-model:latest",
+                run_dir,
+                risk={"classification": "low"},
+                run_date="2030-02-03",
+            )
+            agent = (
+                run_dir
+                / "opencode-runtime/config/opencode/agents/local-mvp-coder.md"
+            ).read_text(encoding="utf-8")
+        self.assertIn("  edit:\n    allow", agent)
+        self.assertNotIn('"docs/devlog/2030-02-03.md": allow', agent)
+
+    @unittest.skipUnless(shutil.which("opencode"), "requires local OpenCode")
+    def test_generated_opencode_agent_can_edit_a_scoped_candidate_file(self):
+        """Exercise the installed OpenCode permission parser, not YAML alone."""
+        settings = replace(
+            MODULE.load_settings(), opencode_command="opencode"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            run_dir = root / "run"
+            (project / "src").mkdir(parents=True)
+            run_dir.mkdir()
+            target = project / "src/app.py"
+            target.write_text("before\n", encoding="utf-8")
+            (project / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["true"]\n', encoding="utf-8"
+            )
+            (run_dir / "plan.md").write_text(
+                "# Plan\n\n- Update `src/app.py`.\n", encoding="utf-8"
+            )
+            _config_path, environment = MODULE.prepare_opencode_runtime(
+                settings,
+                project,
+                "qwen3-coder:30b",
+                run_dir,
+                risk={"classification": "low"},
+            )
+            resolved = project.resolve()
+            result = subprocess.run(
+                [
+                    "opencode",
+                    "debug",
+                    "agent",
+                    settings.opencode_agent,
+                    "--pure",
+                    "--tool",
+                    "edit",
+                    "--params",
+                    json.dumps(
+                        {
+                            "filePath": "src/app.py",
+                            "oldString": "before",
+                            "newString": "after",
+                        }
+                    ),
+                ],
+                cwd=resolved,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=30,
+                env={
+                    **MODULE.clean_child_environment(),
+                    **environment,
+                    "PWD": str(resolved),
+                    "OLDPWD": str(resolved),
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(target.read_text(encoding="utf-8"), "after\n")
+
+    def test_opencode_implementation_workspace_excludes_project_controls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            run_dir = root / "run"
+            project.mkdir()
+            run_dir.mkdir()
+            (project / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["true"]\n', encoding="utf-8"
+            )
+            (project / "opencode.json").write_text(
+                '{"mcp":{"untrusted":{"command":"false"}}}\n',
+                encoding="utf-8",
+            )
+            plugin = project / ".opencode/plugins/untrusted.js"
+            plugin.parent.mkdir(parents=True)
+            plugin.write_text("throw new Error('must not load')\n", encoding="utf-8")
+            container, workspace = MODULE.make_disposable_baseline_workspace(
+                project,
+                run_dir,
+                exclude_opencode_project_controls=True,
+            )
+            try:
+                self.assertTrue((project / "opencode.json").is_file())
+                self.assertTrue(plugin.is_file())
+                self.assertFalse((workspace / "opencode.json").exists())
+                self.assertFalse((workspace / ".opencode").exists())
+                self.assertFalse(
+                    any(
+                        MODULE.is_opencode_project_control_path(
+                            path.relative_to(workspace)
+                        )
+                        for path in workspace.rglob("*")
+                    )
+                )
+            finally:
+                MODULE.cleanup_baseline_workspace(container)
+
+    def test_opencode_runtime_rejects_a_plan_for_project_controls(self):
+        settings = MODULE.load_settings()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            run_dir = root / "run"
+            project.mkdir()
+            run_dir.mkdir()
+            (project / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["true"]\n', encoding="utf-8"
+            )
+            (run_dir / "plan.md").write_text(
+                "# Plan\n\n- `opencode.json`\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(MODULE.WorkflowError, "OpenCode 项目控制"):
+                MODULE.prepare_opencode_runtime(
+                    settings,
+                    project,
+                    "test-model:latest",
+                    run_dir,
+                    risk={"classification": "low"},
+                )
+
+    def test_opencode_control_plan_is_marked_for_direct_cloud_routing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            plan = root / "plan.md"
+            project.mkdir()
+            (project / ".opencode").mkdir()
+            plan.write_text(
+                "# Plan\n\nRisk classification: low\n\n- Update `.opencode/agents/coder.md`.\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(
+                MODULE.plan_declares_opencode_project_controls(project, plan)
+            )
+
+            plan.write_text(
+                "# Plan\n\nRisk classification: low\n\n- Update `src/app.py`.\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(
+                MODULE.plan_declares_opencode_project_controls(project, plan)
+            )
+
+    def test_call_opencode_coder_uses_pure_json_and_masks_prompt_log(self):
+        settings = MODULE.load_settings()
+        output = json.dumps(
+            {
+                "type": "text",
+                "sessionID": "ses_local",
+                "part": {"text": "已完成"},
+            }
+        )
+        completed = subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            run_dir = root / "run"
+            project.mkdir()
+            run_dir.mkdir()
+            (root / "runtime/tmp").mkdir(parents=True)
+            attached_prompts: list[tuple[Path, str]] = []
+
+            def fake_run(command, **_kwargs):
+                prompt_path = Path(command[command.index("--file") + 1])
+                attached_prompts.append(
+                    (prompt_path, prompt_path.read_text(encoding="utf-8"))
+                )
+                return completed
+
+            with (
+                mock.patch.object(MODULE, "ensure_opencode_available"),
+                mock.patch.object(
+                    MODULE,
+                    "prepare_opencode_runtime",
+                    return_value=(
+                        root / "runtime/config/opencode/opencode.json",
+                        {"HOME": str(root)},
+                    ),
+                ),
+                mock.patch.object(
+                    MODULE.shutil, "which", return_value="/bin/echo"
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "write_opencode_profile",
+                    return_value=root / "opencode.sb",
+                ) as write_profile,
+                mock.patch.object(
+                    MODULE, "run_command", side_effect=fake_run
+                ) as run_command,
+            ):
+                result = MODULE.call_opencode_coder(
+                    settings,
+                    project,
+                    "test-model:latest",
+                    "SECRET APPROVED PROMPT",
+                    run_dir,
+                    "coder-initial",
+                    risk={"classification": "low"},
+                )
+
+            command = run_command.call_args.args[0]
+            kwargs = run_command.call_args.kwargs
+            self.assertEqual(command[:2], ["sandbox-exec", "-f"])
+            self.assertIn("--pure", command)
+            self.assertEqual(command[command.index("--format") + 1], "json")
+            self.assertNotIn("--auto", command)
+            self.assertNotIn("SECRET APPROVED PROMPT", command)
+            self.assertIn("--file", command)
+            self.assertIn(
+                "Read the attached approved task", command[-1]
+            )
+            self.assertNotIn(
+                "SECRET APPROVED PROMPT", " ".join(kwargs["command_for_log"])
+            )
+            self.assertIsNone(kwargs["stdin_text"])
+            self.assertEqual(len(attached_prompts), 1)
+            self.assertEqual(attached_prompts[0][1], "SECRET APPROVED PROMPT")
+            self.assertFalse(attached_prompts[0][0].exists())
+            self.assertEqual(kwargs["extra_env"]["PWD"], str(project.resolve()))
+            self.assertEqual(kwargs["extra_env"]["OLDPWD"], str(project.resolve()))
+            self.assertTrue(kwargs["clean_environment"])
+            self.assertEqual(
+                write_profile.call_args.args[1], root / "runtime"
+            )
+            self.assertEqual(result.session_id, "ses_local")
+            self.assertEqual(
+                (run_dir / "coder-initial-last-message.txt").read_text(
+                    encoding="utf-8"
+                ),
+                "已完成",
+            )
+
+    def test_timeout_exception_and_watchdog_do_not_persist_opencode_prompt(self):
+        prompt = "FULL APPROVED PROMPT MUST NOT REACH WATCHDOG"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log_path = root / "opencode.log"
+            raw_timeout = subprocess.TimeoutExpired(
+                ["opencode", "run", prompt], 1, output="partial output"
+            )
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "run_streaming_process",
+                    side_effect=raw_timeout,
+                ),
+                self.assertRaises(subprocess.TimeoutExpired) as caught,
+            ):
+                MODULE.run_command(
+                    ["opencode", "run", "--format", "json"],
+                    cwd=root,
+                    timeout=1,
+                    stdin_text=prompt,
+                    log_path=log_path,
+                    monitor=True,
+                    command_for_log=[
+                        "opencode",
+                        "run",
+                        "--format",
+                        "json",
+                    ],
+                )
+            watchdog = MODULE.watchdog_review(
+                root, "coder-initial", caught.exception
+            )
+            persisted = (root / "watchdog.json").read_text(encoding="utf-8")
+            self.assertNotIn(prompt, persisted)
+            self.assertNotIn(prompt, str(caught.exception.cmd))
+            self.assertNotIn(prompt, json.dumps(watchdog, ensure_ascii=False))
+            self.assertNotIn(prompt, log_path.read_text(encoding="utf-8"))
+
+    def test_opencode_seatbelt_profile_limits_writes_to_private_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            runtime = root / "runtime"
+            run_dir = root / "run"
+            outside = root / "outside"
+            for path in (workspace, runtime, run_dir, outside):
+                path.mkdir()
+
+            profile = MODULE.write_opencode_profile(
+                workspace,
+                runtime,
+                run_dir,
+                Path("/bin/echo"),
+                "http://127.0.0.1:11434",
+            ).read_text(encoding="utf-8")
+
+            self.assertIn("(deny default)", profile)
+            self.assertIn(
+                f'(allow file-write* (subpath "{workspace.resolve()}"))',
+                profile,
+            )
+            self.assertIn(
+                f'(allow file-write* (subpath "{runtime.resolve()}"))',
+                profile,
+            )
+            self.assertNotIn(
+                f'(allow file-write* (subpath "{outside.resolve()}"))',
+                profile,
+            )
+            self.assertIn(str(workspace / ".git"), profile)
+            self.assertIn(str(workspace / "opencode.json"), profile)
+            self.assertIn(str(workspace / ".opencode"), profile)
+            self.assertIn(
+                '(allow network-outbound (remote ip "localhost:11434"))',
+                profile,
+            )
+            self.assertNotIn('remote ip "127.0.0.1:11434"', profile)
+            self.assertNotIn("localhost:*", profile)
+            self.assertNotIn("(allow network*)", profile)
+            self.assertIn(
+                f'(allow file-read* (subpath "{run_dir.resolve()}"))', profile
+            )
+            self.assertNotIn(
+                f'(allow file-write* (subpath "{run_dir.resolve()}"))', profile
+            )
+
+    def test_promotion_applies_only_plan_scope_and_returns_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            run_dir = root / "run"
+            target.mkdir()
+            run_dir.mkdir()
+            (target / "src").mkdir()
+            (target / "src/app.py").write_text("old\n", encoding="utf-8")
+            (target / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["true"]\n', encoding="utf-8"
+            )
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=target, check=True)
+            subprocess.run(
+                [
+                    "git", "-c", "user.name=Test", "-c",
+                    "user.email=test@example.invalid", "commit", "-qm", "base",
+                ],
+                cwd=target,
+                check=True,
+            )
+            (run_dir / "plan.md").write_text(
+                "# Plan\n\n- 修改 `src/app.py`。\n", encoding="utf-8"
+            )
+            expected = MODULE.project_integrity_snapshot(target)
+            container, workspace = MODULE.make_disposable_baseline_workspace(
+                target, run_dir
+            )
+            try:
+                (workspace / "src/app.py").write_text("new\n", encoding="utf-8")
+                changed, validation, cleanup_warning = MODULE.promote_implementation_workspace(
+                    workspace,
+                    target,
+                    run_dir,
+                    run_dir / "plan.md",
+                    expected,
+                    lambda _candidate: {"status": "passed"},
+                )
+            finally:
+                MODULE.cleanup_baseline_workspace(container)
+
+            self.assertEqual(changed, ["src/app.py"])
+            self.assertEqual(validation, {"status": "passed"})
+            self.assertIsNone(cleanup_warning)
+            self.assertEqual(
+                (target / "src/app.py").read_text(encoding="utf-8"), "new\n"
+            )
+
+    def test_promotion_keeps_the_run_start_date_for_devlog_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            run_dir = root / "run"
+            target.mkdir()
+            run_dir.mkdir()
+            devlog = target / "docs/devlog/2030-02-03.md"
+            devlog.parent.mkdir(parents=True)
+            devlog.write_text("old\n", encoding="utf-8")
+            (target / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["true"]\n', encoding="utf-8"
+            )
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=target, check=True)
+            subprocess.run(
+                [
+                    "git", "-c", "user.name=Test", "-c",
+                    "user.email=test@example.invalid", "commit", "-qm", "base",
+                ],
+                cwd=target,
+                check=True,
+            )
+            (run_dir / "plan.md").write_text("# Plan\n", encoding="utf-8")
+            expected = MODULE.project_integrity_snapshot(target)
+            container, workspace = MODULE.make_disposable_baseline_workspace(
+                target, run_dir
+            )
+            try:
+                (workspace / "docs/devlog/2030-02-03.md").write_text(
+                    "new\n", encoding="utf-8"
+                )
+                changed, _validation, cleanup_warning = (
+                    MODULE.promote_implementation_workspace(
+                        workspace,
+                        target,
+                        run_dir,
+                        run_dir / "plan.md",
+                        expected,
+                        lambda _candidate: {"status": "passed"},
+                        run_date="2030-02-03",
+                    )
+                )
+            finally:
+                MODULE.cleanup_baseline_workspace(container)
+
+            self.assertEqual(changed, ["docs/devlog/2030-02-03.md"])
+            self.assertIsNone(cleanup_warning)
+            self.assertEqual(devlog.read_text(encoding="utf-8"), "new\n")
+
+    def test_promotion_rejects_out_of_scope_and_rolls_back_validation_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            run_dir = root / "run"
+            target.mkdir()
+            run_dir.mkdir()
+            (target / "src").mkdir()
+            (target / "src/app.py").write_text("old\n", encoding="utf-8")
+            (target / "other.txt").write_text("protected\n", encoding="utf-8")
+            (target / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["true"]\n', encoding="utf-8"
+            )
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=target, check=True)
+            subprocess.run(
+                [
+                    "git", "-c", "user.name=Test", "-c",
+                    "user.email=test@example.invalid", "commit", "-qm", "base",
+                ],
+                cwd=target,
+                check=True,
+            )
+            (run_dir / "plan.md").write_text(
+                "# Plan\n\n- 修改 `src/app.py`。\n", encoding="utf-8"
+            )
+            expected = MODULE.project_integrity_snapshot(target)
+
+            container, workspace = MODULE.make_disposable_baseline_workspace(
+                target, run_dir
+            )
+            try:
+                (workspace / "other.txt").write_text("bad\n", encoding="utf-8")
+                with self.assertRaisesRegex(MODULE.WorkflowError, "越出批准范围"):
+                    MODULE.promote_implementation_workspace(
+                        workspace,
+                        target,
+                        run_dir,
+                        run_dir / "plan.md",
+                        expected,
+                        lambda _candidate: None,
+                    )
+            finally:
+                MODULE.cleanup_baseline_workspace(container)
+            self.assertEqual(
+                (target / "other.txt").read_text(encoding="utf-8"), "protected\n"
+            )
+
+            container, workspace = MODULE.make_disposable_baseline_workspace(
+                target, run_dir
+            )
+            try:
+                (workspace / "src/app.py").write_text("candidate\n", encoding="utf-8")
+
+                def fail_validation(_candidate):
+                    raise MODULE.WorkflowError("target validation failed")
+
+                with self.assertRaisesRegex(MODULE.WorkflowError, "validation failed"):
+                    MODULE.promote_implementation_workspace(
+                        workspace,
+                        target,
+                        run_dir,
+                        run_dir / "plan.md",
+                        expected,
+                        fail_validation,
+                    )
+            finally:
+                MODULE.cleanup_baseline_workspace(container)
+            self.assertEqual(
+                (target / "src/app.py").read_text(encoding="utf-8"), "old\n"
+            )
+            MODULE.verify_project_integrity_snapshot(target, expected)
+
+    def test_promotion_rejects_validation_side_effects_before_target_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            run_dir = root / "run"
+            target.mkdir()
+            run_dir.mkdir()
+            (target / "src").mkdir()
+            (target / "src/app.py").write_text("old\n", encoding="utf-8")
+            (target / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["true"]\n', encoding="utf-8"
+            )
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=target, check=True)
+            subprocess.run(
+                [
+                    "git", "-c", "user.name=Test", "-c",
+                    "user.email=test@example.invalid", "commit", "-qm", "base",
+                ],
+                cwd=target,
+                check=True,
+            )
+            (run_dir / "plan.md").write_text(
+                "# Plan\n\n- 修改 `src/app.py`。\n", encoding="utf-8"
+            )
+            expected = MODULE.project_integrity_snapshot(target)
+            container, workspace = MODULE.make_disposable_baseline_workspace(
+                target, run_dir
+            )
+            try:
+                (workspace / "src/app.py").write_text("candidate\n", encoding="utf-8")
+
+                def poison_candidate(candidate):
+                    (candidate / "src/app.py").write_text(
+                        "unreviewed overwrite\n", encoding="utf-8"
+                    )
+                    (candidate / "UNRELATED.txt").write_text(
+                        "must not promote\n", encoding="utf-8"
+                    )
+                    return {"status": "passed"}
+
+                with self.assertRaisesRegex(MODULE.WorkflowError, "未评审"):
+                    MODULE.promote_implementation_workspace(
+                        workspace,
+                        target,
+                        run_dir,
+                        run_dir / "plan.md",
+                        expected,
+                        poison_candidate,
+                    )
+            finally:
+                MODULE.cleanup_baseline_workspace(container)
+
+            self.assertEqual((target / "src/app.py").read_text(encoding="utf-8"), "old\n")
+            self.assertFalse((target / "UNRELATED.txt").exists())
+            MODULE.verify_project_integrity_snapshot(target, expected)
+
+    def test_promotion_backup_failure_leaves_target_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            run_dir = root / "run"
+            target.mkdir()
+            run_dir.mkdir()
+            (target / "src").mkdir()
+            (target / "src/app.py").write_text("old\n", encoding="utf-8")
+            (target / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["true"]\n', encoding="utf-8"
+            )
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=target, check=True)
+            subprocess.run(
+                [
+                    "git", "-c", "user.name=Test", "-c",
+                    "user.email=test@example.invalid", "commit", "-qm", "base",
+                ],
+                cwd=target,
+                check=True,
+            )
+            (run_dir / "plan.md").write_text(
+                "# Plan\n\n- 修改 `src/app.py`。\n", encoding="utf-8"
+            )
+            expected = MODULE.project_integrity_snapshot(target)
+            container, workspace = MODULE.make_disposable_baseline_workspace(
+                target, run_dir
+            )
+            try:
+                (workspace / "src/app.py").write_text("candidate\n", encoding="utf-8")
+                with mock.patch.object(
+                    MODULE.shutil,
+                    "copy2",
+                    side_effect=OSError("backup media failure"),
+                ):
+                    with self.assertRaisesRegex(OSError, "backup media failure"):
+                        MODULE.promote_implementation_workspace(
+                            workspace,
+                            target,
+                            run_dir,
+                            run_dir / "plan.md",
+                            expected,
+                            lambda _candidate: {"status": "passed"},
+                        )
+            finally:
+                MODULE.cleanup_baseline_workspace(container)
+
+            self.assertEqual(
+                (target / "src/app.py").read_text(encoding="utf-8"), "old\n"
+            )
+            MODULE.verify_project_integrity_snapshot(target, expected)
+
+    def test_promotion_preserves_concurrent_target_edit_before_replace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            run_dir = root / "run"
+            target.mkdir()
+            run_dir.mkdir()
+            (target / "src").mkdir()
+            target_file = target / "src/app.py"
+            target_file.write_text("old\n", encoding="utf-8")
+            (target / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["true"]\n', encoding="utf-8"
+            )
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=target, check=True)
+            subprocess.run(
+                [
+                    "git", "-c", "user.name=Test", "-c",
+                    "user.email=test@example.invalid", "commit", "-qm", "base",
+                ],
+                cwd=target,
+                check=True,
+            )
+            (run_dir / "plan.md").write_text(
+                "# Plan\n\n- 修改 `src/app.py`。\n", encoding="utf-8"
+            )
+            expected = MODULE.project_integrity_snapshot(target)
+            container, workspace = MODULE.make_disposable_baseline_workspace(
+                target, run_dir
+            )
+            try:
+                candidate = workspace / "src/app.py"
+                candidate.write_text("reviewed\n", encoding="utf-8")
+                original_copy2 = MODULE.shutil.copy2
+
+                def copy_candidate_then_edit_target(source, destination, *args, **kwargs):
+                    result = original_copy2(source, destination, *args, **kwargs)
+                    if Path(source).resolve() == candidate.resolve():
+                        target_file.write_text("user edit\n", encoding="utf-8")
+                    return result
+
+                with mock.patch.object(
+                    MODULE.shutil,
+                    "copy2",
+                    side_effect=copy_candidate_then_edit_target,
+                ):
+                    with self.assertRaises(MODULE.ProjectChangedError):
+                        MODULE.promote_implementation_workspace(
+                            workspace,
+                            target,
+                            run_dir,
+                            run_dir / "plan.md",
+                            expected,
+                            lambda _candidate: {"status": "passed"},
+                        )
+            finally:
+                MODULE.cleanup_baseline_workspace(container)
+
+            self.assertEqual(target_file.read_text(encoding="utf-8"), "user edit\n")
+
+    def test_promotion_rolls_back_when_backup_cleanup_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            run_dir = root / "run"
+            target.mkdir()
+            run_dir.mkdir()
+            (target / "src").mkdir()
+            (target / "src/app.py").write_text("old\n", encoding="utf-8")
+            (target / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["true"]\n', encoding="utf-8"
+            )
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=target, check=True)
+            subprocess.run(
+                [
+                    "git", "-c", "user.name=Test", "-c",
+                    "user.email=test@example.invalid", "commit", "-qm", "base",
+                ],
+                cwd=target,
+                check=True,
+            )
+            (run_dir / "plan.md").write_text(
+                "# Plan\n\n- 修改 `src/app.py`。\n", encoding="utf-8"
+            )
+            expected = MODULE.project_integrity_snapshot(target)
+            container, workspace = MODULE.make_disposable_baseline_workspace(
+                target, run_dir
+            )
+            try:
+                (workspace / "src/app.py").write_text("candidate\n", encoding="utf-8")
+                def partial_backup_cleanup(container, _error_type, _label):
+                    (container / "src/app.py").unlink()
+                    raise MODULE.WorkflowError("backup cleanup failed")
+
+                with mock.patch.object(
+                    MODULE,
+                    "cleanup_private_tree",
+                    side_effect=partial_backup_cleanup,
+                ):
+                    _changed, _validation, cleanup_warning = (
+                        MODULE.promote_implementation_workspace(
+                            workspace,
+                            target,
+                            run_dir,
+                            run_dir / "plan.md",
+                            expected,
+                            lambda _candidate: {"status": "passed"},
+                        )
+                    )
+            finally:
+                MODULE.cleanup_baseline_workspace(container)
+
+            self.assertEqual(
+                (target / "src/app.py").read_text(encoding="utf-8"), "candidate\n"
+            )
+            self.assertIn("备份清理待处理", cleanup_warning)
+
+    def test_opencode_run_edits_disposable_workspace_then_promotes_after_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            run_dir = root / "run"
+            target.mkdir()
+            run_dir.mkdir()
+            (target / "src").mkdir()
+            (target / "src/app.py").write_text("old\n", encoding="utf-8")
+            (target / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["true"]\n', encoding="utf-8"
+            )
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=target, check=True)
+            subprocess.run(
+                [
+                    "git", "-c", "user.name=Test", "-c",
+                    "user.email=test@example.invalid", "commit", "-qm", "base",
+                ],
+                cwd=target,
+                check=True,
+            )
+            approved_plan = root / "approved-plan.md"
+            approved_plan.write_text(
+                "# Plan\n\nRisk classification: low\n\n- 修改 `src/app.py`。\n",
+                encoding="utf-8",
+            )
+            observed_workspace: list[Path] = []
+
+            def fake_validations(project, commands, evidence, stage, **kwargs):
+                log = evidence / f"{stage}-fake-validation.log"
+                log.write_text("passed\n", encoding="utf-8")
+                return [{"command": commands[0], "exit_code": 0, "log": str(log)}]
+
+            def fake_docs(project, evidence, stage, today):
+                log = evidence / f"{stage}-fake-docs.log"
+                log.write_text("passed\n", encoding="utf-8")
+                return {
+                    "command": "documentation-contract",
+                    "exit_code": 0,
+                    "log": str(log),
+                }
+
+            def fake_local(_settings, project, *_args, **_kwargs):
+                self.assertNotEqual(project.resolve(), target.resolve())
+                observed_workspace.append(project)
+                (project / "src/app.py").write_text("new\n", encoding="utf-8")
+                today = MODULE.dt.date.today().isoformat()
+                (project / "docs/devlog").mkdir(parents=True, exist_ok=True)
+                (project / "docs/ai").mkdir(parents=True, exist_ok=True)
+                (project / f"docs/devlog/{today}.md").write_text(
+                    "# 开发日志\n", encoding="utf-8"
+                )
+                (project / "docs/ai/PROJECT_OUTLINE.md").write_text(
+                    "# 项目大纲\n", encoding="utf-8"
+                )
+                (project / "docs/ai/TASK_PLAN.md").write_text(
+                    "# 任务规划\n", encoding="utf-8"
+                )
+                result = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+                result.session_id = "ses_e2e"
+                return result
+
+            def fake_reviewer(_settings, project, *_args, **_kwargs):
+                self.assertNotEqual(project.resolve(), target.resolve())
+                self.assertEqual(
+                    (project / "src/app.py").read_text(encoding="utf-8"), "new\n"
+                )
+                self.assertEqual(
+                    (target / "src/app.py").read_text(encoding="utf-8"), "old\n"
+                )
+                return {
+                    "verdict": "pass",
+                    "summary": "通过",
+                    "findings": [],
+                    "tests": ["true"],
+                }
+
+            args = SimpleNamespace(
+                project=str(target),
+                plan=str(approved_plan),
+                model="primary",
+                local_backend="opencode",
+                allow_dirty=False,
+                live=False,
+            )
+            with (
+                mock.patch.object(MODULE, "make_run_dir", return_value=run_dir),
+                mock.patch.object(
+                    MODULE,
+                    "preflight_host",
+                    return_value={
+                        "stage": "host", "status": "passed", "classification": None
+                    },
+                ),
+                mock.patch.object(MODULE, "ensure_model_available"),
+                mock.patch.object(
+                    MODULE,
+                    "ensure_opencode_available",
+                    return_value={
+                        "stage": "opencode-capability",
+                        "status": "passed",
+                        "classification": None,
+                    },
+                ),
+                mock.patch.object(MODULE, "run_validations", side_effect=fake_validations),
+                mock.patch.object(
+                    MODULE,
+                    "validate_development_documents",
+                    side_effect=fake_docs,
+                ),
+                mock.patch.object(MODULE, "call_local_coder", side_effect=fake_local),
+                mock.patch.object(MODULE, "call_reviewer", side_effect=fake_reviewer),
+            ):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    result = MODULE.command_run(args)
+
+            summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                (target / "src/app.py").read_text(encoding="utf-8"), "new\n"
+            )
+            self.assertTrue(observed_workspace)
+            self.assertFalse(observed_workspace[0].exists())
+            self.assertTrue(summary["workflow"]["implementation_workspace"]["used"])
+            self.assertTrue(
+                summary["workflow"]["implementation_workspace"]["promoted"]
+            )
+            self.assertEqual(summary["workflow"]["local_session_id"], "ses_e2e")
 
 
 if __name__ == "__main__":

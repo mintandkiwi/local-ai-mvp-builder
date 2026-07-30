@@ -2,7 +2,7 @@
 
 ## 当前里程碑
 
-M4：Local AI MVP Builder Token 效率整改。TE-001 至 TE-009 已完成；TE-010 已获用户单独授权并完成阶段性真实 A/B，但完整样本数不足，效率结论为 `inconclusive`。
+M5：OpenCode 主后端升级。OpenCode 负责本地 Agent 内部编码迭代，Codex 直连本地推理保留为显式备用；云端 Codex 继续承担独立 Review、看门狗接管和终审。
 
 ## 已完成
 
@@ -25,10 +25,11 @@ M4：Local AI MVP Builder Token 效率整改。TE-001 至 TE-009 已完成；TE-
 
 ## 进行中
 
-- `TE-010B`：先冻结并提交唯一 Skill 版本；等待云端额度恢复后，从全新实验根目录重跑全部 3 组配对。未经 3 组有效完整配对和等价质量门槛，不关闭效率验证。
+- 当前没有进行中的实施任务。
 
 ## 待办
 
+- `OC-004`：用户评审后再单独决定 commit、push 与 GitHub PR；本轮未获得 push 授权。
 - `M4-FOLLOWUP`：如 A/B 中位数云端 Token 未下降 25% 或成功/安全标准不等价，将 claim 记为 `regression`/`inconclusive` 并调整路由，不关闭优化验证。
 
 ## 验收标准
@@ -40,6 +41,8 @@ M4：Local AI MVP Builder Token 效率整改。TE-001 至 TE-009 已完成；TE-
 - capsule 有字节数、字段和截断元数据，不泄露凭据、私钥、原始提示或私有 remote。
 - `ready_for_user_review` 仍要求项目验证、中文三文档和独立 review 全部通过。
 - 全部项目测试、Python 编译、Shell 语法、Skill quick validation、CLI help 和 `git diff --check` 通过。
+- `OC-001`、`OC-002` 已完成：173 项原生回归、OpenCode doctor、Seatbelt 写边界实测、真实 OpenCode 最小 smoke 和安装器演练均通过。
+- `OC-003` 已完成：独立 Code Review 的 P0–P2 反馈已闭环；最终未提交差异审查未发现 P0–P2 finding。
 
 ## 下一步
 
