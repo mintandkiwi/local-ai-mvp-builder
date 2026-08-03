@@ -16,11 +16,15 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["severity", "title", "file", "line", "description", "required_fix"],
+        "required": ["severity", "category", "title", "file", "line", "description", "required_fix"],
         "properties": {
           "severity": {
             "type": "string",
             "enum": ["P0", "P1", "P2", "P3"]
+          },
+          "category": {
+            "type": "string",
+            "enum": ["security", "data_loss", "correctness", "documentation", "performance", "reliability", "testing", "other"]
           },
           "title": {"type": "string"},
           "file": {"type": "string"},

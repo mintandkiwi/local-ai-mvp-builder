@@ -2,38 +2,55 @@
 
 ## 当前里程碑
 
-里程碑 M2：完成可长期复用的低 token 本地 AI 开发闭环，并准备用户验收后的 GitHub 交付。
+M5：OpenCode 主后端升级。OpenCode 负责本地 Agent 内部编码迭代，Codex 直连本地推理保留为显式备用；云端 Codex 继续承担独立 Review、看门狗接管和终审。
 
 ## 已完成
 
-- `M2-01`：部署 Qwen 主模型和备选模型。
-- `M2-02`：实现计划导入、本地编码、项目验证和结构化 Code Review。
-- `M2-03`：实现两轮本地修复阈值及 Codex 监督者接管。
-- `M2-04`：实现安全实时事件流和简洁输出模式。
-- `M2-05`：实现中文当日日志、AI 项目大纲和 AI 任务规划契约。
-- `M2-06`：实现本地模型 300 秒停滞看门狗与失败接管。
-- `M2-07`：实现不包含 remote URL 的 Git 版本快照。
-- `M2-08`：完成 29 项单元测试和 Skill 格式校验。
+- `TE-001`：实现 JSON `turn.completed.usage` 与 `tokens used` 文本解析；重复完成事件不重复求和，大整数保真，缺失/损坏为 unavailable/null；成功、失败、超时入口统一生成阶段记录。
+- `TE-002`：在兼容旧字段基础上扩展 summary 的 `usage`、`workflow`、`risk`、`preflight`、`context_capsules` 和 `efficiency`；增加凭据脱敏与 no_baseline 安全回归。
+- `TE-003`：官方启动器在任何 Git/config/doctor 项目检查前进入编排器唯一加锁入口；第一次 clean 检查前获取 workspace 外的跨前端项目锁。在排除 `.envrc`、任意层级 `.direnv` 和 `.docker/config.json` 等已知敏感路径的私有可丢弃副本中，以正式 Seatbelt 和等价项目写权限运行干净基线；普通 `.docker` 目录/Dockerfile 保留。结束后两阶段清理嵌套权限/flags 并确认副本不存在，再在模型前复核 HEAD、完整 porcelain 和稳定配置快照；任一失败时真实目标与用户文件不变，agent 调用为 0。
+- `TE-004`：默认改为 adaptive，最多两轮 pre-takeover review；schema 强制 finding category，首次 P0/P1、安全/数据丢失/可靠性/未知类别或大量 finding 立即接管，只有明确的普通局部 P2 才允许一次 fixer；保留 legacy 回滚值。
+- `TE-005`：计划正文强制恰好一条完整 `Risk classification: low`/`medium`/`high` 声明；占位符、代码块示例、重复或冲突均按 high，high 关键实现 direct-cloud，local coder 仅处理 low/medium。
+- `TE-006`：生成可审计、去敏、UTF-8 安全、大小受限的 context capsule，提示词改为完整计划路径加 capsule/按需仓库读取。
+- `TE-007`：增加云端软 Token 预算、最大调用数、cloud lower bound 和保守预算状态；计量不完整不判定为预算内。
+- `TE-008`：更新唯一 Skill、plan/evidence reference、UI 元数据、README、CLI 帮助和中文 AI 文档。
+- `TE-009A`：新增模拟回归覆盖 Token JSON/文本/缺失/损坏/重复/大整数、summary 安全、基线零调用、low/medium/high 路由、首轮 P1、局部 P2、P3-only、watchdog、quoted/多行凭据、各类私钥、reviewer 能力预检和大 capsule 脱敏/截断。
+- `TE-009B`：独立 `review-4` 至 `review-35` 共发现 25 个 P1、77 个 P2（`review-15`、`review-26` 无 verdict）；全部有效 finding 已修复，原生回归由 68 项增至 143 项，并覆盖外置证据、内容快照、风险/类别策略、凭据脱敏、去敏 Git 视图、子仓库路由和事务安装。
+- `TE-009C`：`review-36` 核验 12 项门禁、完整证据哈希和冻结快照后返回 `pass`、0 finding；summary 已达到 `ready_for_user_review`。
+- `RELEASE-001`：完成中英文 README、143 项发布前回归和辅助门禁；提交 `b295221` 已推送到 `origin/agent/cross-agent-skill`，现有 Draft PR #1 自动纳入升级。
+- `RELEASE-002`：将公开中英文 README 改为部署无关说明，移除维护者机器容量、具体模型、个人代理和硬件评估入口，保留可配置后端与 `doctor` 兼容性门禁。
+- `TE-010A`：冻结 3 组等价低/中风险任务并完成首组探索性观测；两条路线质量门槛均通过，local-first 云端 Token 比 direct-cloud 增加 11.79%。但 Skill 工作版本在两臂之间发生验证驱动修复，该观测不进入正式验收统计。第二组在 direct-cloud 修改阶段受外部用量限制中断，已记录 552,605 Token 精确下限但不纳入配对统计。
+- `TE-010-GUARD`：实验 harness 强制准备和各臂前后使用同一干净提交；HEAD 或工作树漂移时拒绝继续，并要求创建全新实验根目录。
+- `TE-010-REPORT`：生成中英文阶段性报告和机器可读汇总，公开结论为 `inconclusive`，不披露维护者机器、具体模型、私有路径或原始日志。
+- `DS-001`：新增 OpenCode DeepSeek provider(cloud API 路线),修复 smoke 暴露的 external_directory 误拦、Seatbelt 网络/DNS、models.dev 缓存与 usage 脱敏误杀;A/B smoke 结论:deepseek-v4-pro 一轮完成任务(本地阶段 $0.0159),qwen3-coder:30b 零编辑失败;"省 token"假设不成立,收益为质量与精确计量。
+- `DS-002`：新增 `scripts/token_report.py`,按北京时间分天对比主代理(Claude 转录)与执行层(OpenCode/DeepSeek)的 token 与美元成本。
 
 ## 进行中
 
-- `M2-09`：等待用户评审工作流升级和文档结构。
+- 当前没有进行中的实施任务。
 
 ## 待办
 
-- `M2-10`：根据用户意见调整文档字段、看门狗阈值或状态汇报粒度。
-- `M2-11`：用户确认后生成正式 Conventional Commit。
-- `M2-12`：按用户指定的仓库、可见性和分支策略上传 GitHub并创建 Draft PR。
-- `M3-01`：使用首个真实 MVP 验证长任务接管、每日多次日志追加和发布流程。
+- `OC-004`：M5 与 DS-001/DS-002 改动已获用户授权,随 `9617cd2` 推送至 `origin/agent/cross-agent-skill`;PR 合并另行决定。
+- `M4-FOLLOWUP`：如 A/B 中位数云端 Token 未下降 25% 或成功/安全标准不等价，将 claim 记为 `regression`/`inconclusive` 并调整路由，不关闭优化验证。
+- `DS-FOLLOWUP-1`：修复 `plan_declared_project_paths` 句子边界正则双向误判(M5 review 遗留)。
+- `DS-FOLLOWUP-2`：修复 deepseek 路线下 summary `model` 字段仍显示默认本地模型名。
+- `DS-FOLLOWUP-3`：codex CLI 重新登录后,跑含云端 review 的完整闭环复测。
 
 ## 验收标准
 
-- 本地模型正常时，完成代码、测试和三份中文文档后才允许 Review 通过。
-- 本地模型失败或 300 秒无结构化进展时，Codex 自动接管，不要求用户重新启动流程。
-- Codex 对话不复制本地模型运行细节，只报告关键阶段和异常。
-- `summary.json` 包含最终状态、验证、Git diff 和安全版本快照。
-- 未得到用户授权时不存在自动 commit、push、tag 或 GitHub 仓库创建行为。
+- 每个已启动 agent 阶段有唯一记录；未知 Token 为 null/unavailable，partial 不称完整。
+- 基线/环境预检失败时目标工作区保持干净，local/cloud agent 调用均为 0。
+- 首轮 P1 不发生第二次 pre-takeover review；局部 P2 通过路径最多两次 reviewer；接管后重新验证并独立终审。
+- high/未知风险不由本地 coder 独立实现关键代码。
+- capsule 有字节数、字段和截断元数据，不泄露凭据、私钥、原始提示或私有 remote。
+- `ready_for_user_review` 仍要求项目验证、中文三文档和独立 review 全部通过。
+- 全部项目测试、Python 编译、Shell 语法、Skill quick validation、CLI help 和 `git diff --check` 通过。
+- `OC-001`、`OC-002` 已完成：173 项原生回归、OpenCode doctor、Seatbelt 写边界实测、真实 OpenCode 最小 smoke 和安装器演练均通过。
+- `OC-003` 已完成：独立 Code Review 的 P0–P2 反馈已闭环；最终未提交差异审查未发现 P0–P2 finding。
 
 ## 下一步
 
-请用户检查本次新增的日志、AI 文档、看门狗和 GitHub 交付规则。确认后再决定是否创建本地提交以及上传到哪个 GitHub 仓库。
+云端额度恢复后以全新实验根目录完成 3 组配对，独立复核统计与质量等价性；只有中位数云端 Token 至少下降 25% 且所有质量门槛等价通过，才允许形成节省结论。用户同时评审 `https://github.com/mintandkiwi/local-ai-mvp-builder/pull/1`；未经授权不合并到 `main`、不创建 tag 或 release。
+
+证据冻结说明：独立终审 capsule 必须在 tracked 文档停止修改后生成，因此仓库文档只记录上一轮已完成 verdict 与下一步；新一轮外部 capsule/终审结果将在冻结快照之后产生并写入权限受限的运行目录。这是内容快照不可变性约束，不应视为 tracked 状态遗漏。
