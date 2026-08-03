@@ -22,6 +22,8 @@ M5：OpenCode 主后端升级。OpenCode 负责本地 Agent 内部编码迭代�
 - `TE-010A`：冻结 3 组等价低/中风险任务并完成首组探索性观测；两条路线质量门槛均通过，local-first 云端 Token 比 direct-cloud 增加 11.79%。但 Skill 工作版本在两臂之间发生验证驱动修复，该观测不进入正式验收统计。第二组在 direct-cloud 修改阶段受外部用量限制中断，已记录 552,605 Token 精确下限但不纳入配对统计。
 - `TE-010-GUARD`：实验 harness 强制准备和各臂前后使用同一干净提交；HEAD 或工作树漂移时拒绝继续，并要求创建全新实验根目录。
 - `TE-010-REPORT`：生成中英文阶段性报告和机器可读汇总，公开结论为 `inconclusive`，不披露维护者机器、具体模型、私有路径或原始日志。
+- `DS-001`：新增 OpenCode DeepSeek provider(cloud API 路线),修复 smoke 暴露的 external_directory 误拦、Seatbelt 网络/DNS、models.dev 缓存与 usage 脱敏误杀;A/B smoke 结论:deepseek-v4-pro 一轮完成任务(本地阶段 $0.0159),qwen3-coder:30b 零编辑失败;"省 token"假设不成立,收益为质量与精确计量。
+- `DS-002`：新增 `scripts/token_report.py`,按北京时间分天对比主代理(Claude 转录)与执行层(OpenCode/DeepSeek)的 token 与美元成本。
 
 ## 进行中
 
@@ -29,8 +31,11 @@ M5：OpenCode 主后端升级。OpenCode 负责本地 Agent 内部编码迭代�
 
 ## 待办
 
-- `OC-004`：用户评审后再单独决定 commit、push 与 GitHub PR；本轮未获得 push 授权。
+- `OC-004`：M5 与 DS-001/DS-002 改动已获用户授权,随 `9617cd2` 推送至 `origin/agent/cross-agent-skill`;PR 合并另行决定。
 - `M4-FOLLOWUP`：如 A/B 中位数云端 Token 未下降 25% 或成功/安全标准不等价，将 claim 记为 `regression`/`inconclusive` 并调整路由，不关闭优化验证。
+- `DS-FOLLOWUP-1`：修复 `plan_declared_project_paths` 句子边界正则双向误判(M5 review 遗留)。
+- `DS-FOLLOWUP-2`：修复 deepseek 路线下 summary `model` 字段仍显示默认本地模型名。
+- `DS-FOLLOWUP-3`：codex CLI 重新登录后,跑含云端 review 的完整闭环复测。
 
 ## 验收标准
 
