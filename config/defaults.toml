@@ -18,11 +18,17 @@ ollama_host = "http://127.0.0.1:11434"
 [local]
 # OpenCode 是主要本地 Agent 后端；codex-ollama 保留为显式备用，禁止静默 fallback。
 backend = "opencode"
+opencode_provider = "ollama"
 opencode_command = "opencode"
 opencode_agent = "local-mvp-coder"
 opencode_temperature = 0.1
 opencode_low_max_steps = 10
 opencode_medium_max_steps = 16
+
+[local.deepseek]
+model = "deepseek-v4-pro"
+base_url = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"
 
 [cloud]
 provider = "openai"

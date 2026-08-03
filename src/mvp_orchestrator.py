@@ -247,9 +247,13 @@ class Settings:
     local_backend: str
     opencode_command: str
     opencode_agent: str
+    opencode_provider: str
     opencode_temperature: float
     opencode_low_max_steps: int
     opencode_medium_max_steps: int
+    deepseek_model: str
+    deepseek_base_url: str
+    deepseek_api_key_env: str
     cloud_provider: str
     cloud_model: str
     cloud_reasoning_effort: str
@@ -268,6 +272,7 @@ def load_settings() -> Settings:
     runtime = raw["runtime"]
     local = raw.get("local", {})
     cloud = raw["cloud"]
+    deepseek = raw.get("local", {}).get("deepseek", {})
     return Settings(
         max_local_review_rounds=int(workflow["max_local_review_rounds"]),
         strategy=str(workflow.get("strategy", "adaptive")),
@@ -285,11 +290,15 @@ def load_settings() -> Settings:
         local_backend=str(local.get("backend", "opencode")),
         opencode_command=str(local.get("opencode_command", "opencode")),
         opencode_agent=str(local.get("opencode_agent", "local-mvp-coder")),
+        opencode_provider=str(local.get("opencode_provider", "ollama")),
         opencode_temperature=float(local.get("opencode_temperature", 0.1)),
         opencode_low_max_steps=int(local.get("opencode_low_max_steps", 10)),
         opencode_medium_max_steps=int(
             local.get("opencode_medium_max_steps", 16)
         ),
+        deepseek_model=str(deepseek.get("model", "deepseek-v4-pro")),
+        deepseek_base_url=str(deepseek.get("base_url", "https://api.deepseek.com")),
+        deepseek_api_key_env=str(deepseek.get("api_key_env", "DEEPSEEK_API_KEY")),
         cloud_provider=str(cloud["provider"]),
         cloud_model=str(cloud["model"]),
         cloud_reasoning_effort=str(cloud["reasoning_effort"]),
@@ -3631,19 +3640,71 @@ def ensure_model_available(model: str, host: str) -> None:
 
 
 def opencode_capability_probe(settings: Settings) -> dict[str, Any]:
+    executable = shutil.which(settings.opencode_command)
+    required_flags = {
+        "--model", "--agent", "--format", "--session", "--dir", "--pure"
+    }
+    if settings.opencode_provider == "deepseek":
+        api_key_configured = bool(
+            os.environ.get(settings.deepseek_api_key_env, "").strip()
+        )
+        if not executable:
+            return {
+                "stage": "opencode-capability",
+                "status": "failed",
+                "classification": "local_backend_preflight",
+                "command_available": False,
+                "required_flags": sorted(required_flags),
+                "missing_flags": sorted(required_flags),
+                "provider": "deepseek",
+                "api_key_configured": api_key_configured,
+            }
+        try:
+            result = subprocess.run(
+                [executable, "run", "--help"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=15,
+                check=False,
+                env={**os.environ, "NO_COLOR": "1"},
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {
+                "stage": "opencode-capability",
+                "status": "failed",
+                "classification": "local_backend_preflight",
+                "command_available": True,
+                "error": redact_live_text(str(exc)),
+                "provider": "deepseek",
+                "api_key_configured": api_key_configured,
+            }
+        missing = sorted(flag for flag in required_flags if flag not in result.stdout)
+        return {
+            "stage": "opencode-capability",
+            "status": "passed" if result.returncode == 0 and not missing else "failed",
+            "classification": (
+                None
+                if result.returncode == 0 and not missing
+                else "local_backend_preflight"
+            ),
+            "command_available": True,
+            "exit_code": result.returncode,
+            "required_flags": sorted(required_flags),
+            "missing_flags": missing,
+            "provider": "deepseek",
+            "api_key_configured": api_key_configured,
+        }
+    # ollama
     if not is_loopback_ollama_endpoint(settings.ollama_host):
         return {
             "stage": "opencode-capability",
             "status": "failed",
             "classification": "local_backend_preflight",
-            "command_available": bool(shutil.which(settings.opencode_command)),
+            "command_available": bool(executable),
             "ollama_endpoint_loopback": False,
             "error": "OpenCode 主后端只允许回环 Ollama endpoint",
         }
-    executable = shutil.which(settings.opencode_command)
-    required_flags = {
-        "--model", "--agent", "--format", "--session", "--dir", "--pure"
-    }
     if not executable:
         return {
             "stage": "opencode-capability",
@@ -3727,6 +3788,48 @@ def ollama_seatbelt_remote(value: str) -> str:
     return f"localhost:{port}"
 
 
+def _validate_deepseek_base_url(value: str) -> int:
+    """Validate the DeepSeek base URL configuration and return the port.
+
+    Only HTTPS endpoints with an exact allowed host and no embedded userinfo
+    are permitted.  Invalid configurations fail closed with WorkflowError.
+    """
+    if not value:
+        raise WorkflowError("DeepSeek base_url 不能为空")
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except (TypeError, ValueError) as exc:
+        raise WorkflowError(f"DeepSeek base_url 格式无效：{value}") from exc
+    if parsed.scheme != "https":
+        raise WorkflowError("DeepSeek base_url 必须使用 https 协议")
+    if parsed.username or parsed.password:
+        raise WorkflowError("DeepSeek base_url 不得包含 userinfo")
+    allowed_hosts = {parsed.hostname} if parsed.hostname == "api.deepseek.com" else set()
+    if parsed.hostname not in allowed_hosts:
+        raise WorkflowError(f"DeepSeek base_url 域名不在允许列表中：{parsed.hostname}")
+    return parsed.port or 443
+
+
+def deepseek_seatbelt_remote(base_url: str) -> str:
+    """Return the Seatbelt-valid network permission for the DeepSeek provider.
+
+    macOS Seatbelt's ``remote ip`` predicate only accepts ``*`` (any host)
+    or ``localhost``-based addresses; domain-name restrictions such as
+    ``api.deepseek.com`` are unsupported and cause ``sandbox-exec`` to
+    fail with a ``kleene star`` syntax error.  The actual network
+    convergence is enforced by four layers:
+
+    * The Agent has no web-fetch / MCP tools (webfetch, MCP, skill, task
+      are all denied).
+    * The bash allowlist contains no network commands.
+    * ``_validate_deepseek_base_url`` requires an exact https API base URL
+      before the runtime is ever created.
+    * The API key is only meaningful for the DeepSeek API endpoint.
+    """
+    port = _validate_deepseek_base_url(base_url)
+    return f"*:{port}"
+
+
 def _opencode_agent_body() -> str:
     text = OPENCODE_AGENT_TEMPLATE.read_text(encoding="utf-8")
     parts = text.split("---", 2)
@@ -3749,8 +3852,18 @@ def prepare_opencode_runtime(
     run_date: str | None = None,
 ) -> tuple[Path, dict[str, str]]:
     """Create an isolated OpenCode config without loading global user state."""
-    if not is_loopback_ollama_endpoint(settings.ollama_host):
-        raise WorkflowError("OpenCode 主后端只允许回环 Ollama endpoint")
+    is_deepseek = settings.opencode_provider == "deepseek"
+    if is_deepseek:
+        deepseek_remote = deepseek_seatbelt_remote(settings.deepseek_base_url)
+        api_key_env = settings.deepseek_api_key_env
+        api_key_value = os.environ.get(api_key_env, "").strip()
+        if not api_key_value:
+            raise WorkflowError(f"DeepSeek API 密钥环境变量 {api_key_env} 未设置或为空")
+        provider_model = f"deepseek/{settings.deepseek_model}"
+    else:
+        if not is_loopback_ollama_endpoint(settings.ollama_host):
+            raise WorkflowError("OpenCode 主后端只允许回环 Ollama endpoint")
+        provider_model = f"ollama/{model}"
     runtime = run_dir / "opencode-runtime"
     if runtime.is_symlink():
         raise WorkflowError("OpenCode 运行目录不能是符号链接")
@@ -3768,6 +3881,24 @@ def prepare_opencode_runtime(
     for directory in (runtime, config_dir, agents_dir, home, data, state, cache, temporary):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         directory.chmod(0o700)
+
+    # DeepSeek 路线需要 models.dev 注册表才能初始化 provider。开放环境
+    # opencode 会 fetch https://models.dev/api.json，隔离沙箱网络不可达，
+    # 所以必须把宿主缓存 ~/.cache/opencode/models.json 种入隔离缓存目录。
+    # 该文件为公开模型注册表数据，不含凭据；openapi key 已于 config 中设为
+    # {env:...} 占位。
+    if is_deepseek:
+        host_cache_dir = Path.home() / ".cache" / "opencode"
+        host_models = host_cache_dir / "models.json"
+        if not host_models.is_file() or host_models.is_symlink():
+            raise WorkflowError(
+                f"DeepSeek 路线需要 hosts models.dev 缓存，但 {host_models} "
+                "不存在或不是常规文件。请在常规环境先运行 opencode 一次以生成缓存。"
+            )
+        isolated_cache_dir = cache / "opencode"
+        isolated_cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        isolated_cache_dir.chmod(0o700)
+        shutil.copy2(host_models, isolated_cache_dir / "models.json")
 
     plan_path = run_dir / "plan.md"
     allowed = set(plan_declared_project_paths(project, plan_path))
@@ -3795,7 +3926,7 @@ def prepare_opencode_runtime(
         "---",
         "description: 受 Local AI MVP Builder 监督的最小变更本地编码 Agent",
         "mode: primary",
-        f"model: ollama/{model}",
+        f"model: {provider_model}",
         f"temperature: {settings.opencode_temperature}",
         f"steps: {steps}",
         "permission:",
@@ -3823,7 +3954,11 @@ def prepare_opencode_runtime(
         "  task: deny",
         "  skill: deny",
         "  webfetch: deny",
-        "  external_directory: deny",
+        # OpenCode 向上查找 .git 判定项目根；候选副本刻意无 .git，
+        # 将候选目录误判为外部目录。把 external_directory 设为 allow，
+        # 真正的文件系统边界由 Seatbelt profile 强制（候选副本之外全部
+        # deny），本地 Agent 永远无法接触真实目标。
+        "  external_directory: allow",
         "  question: deny",
         "  doom_loop: deny",
         "---",
@@ -3833,19 +3968,35 @@ def prepare_opencode_runtime(
     agent_path = agents_dir / f"{settings.opencode_agent}.md"
     atomic_write_text(agent_path, "\n".join(frontmatter))
 
-    config = {
-        "$schema": "https://opencode.ai/config.json",
-        "model": f"ollama/{model}",
-        "provider": {
-            "ollama": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "Local inference",
-                "options": {"baseURL": settings.ollama_host.rstrip("/") + "/v1"},
-                "models": {model: {"name": "Local deployment model"}},
-            }
-        },
-        "mcp": {},
-    }
+    if is_deepseek:
+        config = {
+            "$schema": "https://opencode.ai/config.json",
+            "model": provider_model,
+            "provider": {
+                "deepseek": {
+                    "npm": "@ai-sdk/deepseek",
+                    "name": "DeepSeek cloud inference",
+                    "apiKey": "{env:" + api_key_env + "}",
+                    "options": {"baseURL": settings.deepseek_base_url.rstrip("/")},
+                    "models": {settings.deepseek_model: {"name": "DeepSeek V4 Pro"}},
+                }
+            },
+            "mcp": {},
+        }
+    else:
+        config = {
+            "$schema": "https://opencode.ai/config.json",
+            "model": f"ollama/{model}",
+            "provider": {
+                "ollama": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "name": "Local inference",
+                    "options": {"baseURL": settings.ollama_host.rstrip("/") + "/v1"},
+                    "models": {model: {"name": "Local deployment model"}},
+                }
+            },
+            "mcp": {},
+        }
     config_path = config_dir / "opencode.json"
     atomic_write_text(
         config_path, json.dumps(config, ensure_ascii=False, indent=2) + "\n"
@@ -3870,14 +4021,13 @@ def write_opencode_profile(
     runtime: Path,
     run_dir: Path,
     executable: Path,
-    ollama_host: str,
+    provider_host: str,
 ) -> Path:
     """Deny OpenCode access outside its sanitized workspace and runtime."""
     workspace = workspace.resolve(strict=True)
     runtime = runtime.resolve(strict=True)
     run_dir = run_dir.resolve(strict=True)
     executable = executable.resolve(strict=True)
-    ollama_remote = ollama_seatbelt_remote(ollama_host)
     allowed_reads = [
         workspace,
         runtime,
@@ -3900,10 +4050,10 @@ def write_opencode_profile(
         '(import "system.sb")',
         "(allow process*)",
         "(allow sysctl-read)",
-        # The Agent has no web/MCP tools. Its process may contact only the one
-        # configured loopback Ollama endpoint; all other local and non-local
-        # network destinations remain denied.
-        f'(allow network-outbound (remote ip "{ollama_remote}"))',
+        f'(allow network-outbound (remote ip "{provider_host}"))',
+        # macOS 域名解析走 mDNSResponder 的 unix socket,Seatbelt 将其归为
+        # network-outbound;实测 curl/bun 均被 deny(1) 拦在此(2026-08-01)。
+        '(allow network-outbound (remote unix-socket (path "/private/var/run/mDNSResponder")))',
         f'(allow file-write* (subpath "{seatbelt_escape(workspace)}"))',
         f'(allow file-write* (subpath "{seatbelt_escape(runtime)}"))',
     ]
@@ -4033,12 +4183,17 @@ def call_opencode_coder(
     if not executable_value:
         raise WorkflowError("OpenCode 可执行文件在能力预检后消失")
     executable = Path(executable_value)
+    is_deepseek = settings.opencode_provider == "deepseek"
+    if is_deepseek:
+        provider_host = deepseek_seatbelt_remote(settings.deepseek_base_url)
+    else:
+        provider_host = ollama_seatbelt_remote(settings.ollama_host)
     profile = write_opencode_profile(
         project,
         config_path.parent.parent.parent,
         run_dir,
         executable,
-        settings.ollama_host,
+        provider_host,
     )
     # subprocess cwd does not rewrite an inherited PWD. OpenCode consults PWD
     # while resolving its workspace, so retain the sanitized implementation
@@ -4048,6 +4203,11 @@ def call_opencode_coder(
         "PWD": str(project.resolve()),
         "OLDPWD": str(project.resolve()),
     }
+    if is_deepseek:
+        api_key_env = settings.deepseek_api_key_env
+        api_key_value = os.environ.get(api_key_env, "").strip()
+        if api_key_value:
+            environment[api_key_env] = api_key_value
     runtime = config_path.parent.parent.parent
     # ``opencode run`` documents ``--file`` as its non-positional task input.
     # Store the complete prompt in the private runtime only for the duration
@@ -4056,6 +4216,7 @@ def call_opencode_coder(
     # approved plan or capsule body.
     prompt_path = runtime / "tmp" / f"{stage}-approved-prompt.md"
     atomic_write_text(prompt_path, prompt)
+    model_ref = f"deepseek/{settings.deepseek_model}" if is_deepseek else f"ollama/{model}"
     command = [
         "sandbox-exec",
         "-f",
@@ -4066,7 +4227,7 @@ def call_opencode_coder(
         "--format",
         "json",
         "--model",
-        f"ollama/{model}",
+        model_ref,
         "--agent",
         settings.opencode_agent,
         "--dir",
@@ -4633,6 +4794,8 @@ def _command_run_locked(args: argparse.Namespace) -> int:
         raise WorkflowError("workflow.strategy 必须是 adaptive 或 legacy")
     if local_backend not in {"opencode", "codex-ollama"}:
         raise WorkflowError("local.backend 必须是 opencode 或 codex-ollama")
+    if settings.opencode_provider not in {"ollama", "deepseek"}:
+        raise WorkflowError("local.opencode_provider 必须是 ollama 或 deepseek")
     if not 0.0 <= settings.opencode_temperature <= 0.3:
         raise WorkflowError("local.opencode_temperature 必须在 0.0 到 0.3 之间")
     if not 1 <= settings.opencode_low_max_steps <= 32:
@@ -4870,12 +5033,23 @@ def _command_run_locked(args: argparse.Namespace) -> int:
             workflow["cloud_calls"] += 1
         started = time.monotonic()
         exit_code = 1
+        raw_output = ""
         try:
             result = action()
             exit_code = int(getattr(result, "returncode", 0) or 0)
+            stdout = getattr(result, "stdout", "") or ""
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode(errors="replace")
+            if not isinstance(stdout, str):
+                stdout = ""
+            raw_output = stdout
             return result
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             exit_code = 124
+            stdout = exc.stdout or ""
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode(errors="replace")
+            raw_output = stdout
             raise
         except Exception as exc:
             reported = getattr(exc, "returncode", None)
@@ -4883,11 +5057,16 @@ def _command_run_locked(args: argparse.Namespace) -> int:
                 exit_code = reported
             raise
         finally:
-            output = ""
-            try:
-                output = log_path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                pass
+            # usage 必须用脱敏前的原始 stdout 解析:落盘日志会把 opencode
+            # step_finish 的 "tokens" 用量字典按密钥子树规则抹成 [REDACTED],
+            # 从日志重读只能得到 measurement=unavailable。parse_token_usage
+            # 只提取数值字段,原始输出不会离开内存。
+            output = raw_output
+            if not output:
+                try:
+                    output = log_path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    pass
             usage_stages.append(
                 usage_stage(
                     stage=stage,

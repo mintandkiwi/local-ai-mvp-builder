@@ -5025,6 +5025,57 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(usage["measurement"], "exact")
         self.assertEqual(usage["total_tokens"], 12)
 
+    def test_opencode_usage_survives_log_redaction_via_raw_stdout(self):
+        # 回归:落盘日志会把 step_finish 的 "tokens" 字典脱敏成
+        # [REDACTED];usage 必须用脱敏前的原始 stdout 解析,否则
+        # measurement 恒为 unavailable(smoke B 组实测暴露)。
+        event = json.dumps(
+            {
+                "type": "step_finish",
+                "part": {
+                    "tokens": {
+                        "input": 8,
+                        "output": 3,
+                        "reasoning": 1,
+                        "total": 12,
+                        "cache": {"read": 4},
+                    }
+                },
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / "coder.log"
+            result = MODULE.run_command(
+                [sys.executable, "-c", f"print({event!r})"],
+                cwd=root,
+                timeout=10,
+                stdin_text=None,
+                log_path=log,
+            )
+            persisted = log.read_text(encoding="utf-8")
+            raw_stage = MODULE.usage_stage(
+                stage="coder-initial",
+                backend="local",
+                role="coder",
+                output=result.stdout,
+                elapsed_seconds=0.1,
+                exit_code=0,
+            )
+            log_stage = MODULE.usage_stage(
+                stage="coder-initial",
+                backend="local",
+                role="coder",
+                output=persisted,
+                elapsed_seconds=0.1,
+                exit_code=0,
+            )
+        self.assertIn('"tokens":"[REDACTED]"', persisted)
+        self.assertEqual(log_stage["measurement"], "unavailable")
+        self.assertEqual(raw_stage["measurement"], "exact")
+        self.assertEqual(raw_stage["total_tokens"], 12)
+        self.assertEqual(raw_stage["cached_input_tokens"], 4)
+
     def test_opencode_output_requires_one_session_and_final_text(self):
         output = "\n".join(
             [
@@ -5220,6 +5271,39 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIn("  edit:\n    allow", agent)
         self.assertNotIn('"docs/devlog/2030-02-03.md": allow', agent)
 
+    def test_opencode_agent_allows_external_directory_with_comment(self):
+        settings = MODULE.load_settings()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            run_dir = root / "run"
+            project.mkdir()
+            run_dir.mkdir()
+            (project / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["true"]\n', encoding="utf-8"
+            )
+            (run_dir / "plan.md").write_text(
+                "# Plan\n\n- `src/app.py`\n", encoding="utf-8"
+            )
+            MODULE.prepare_opencode_runtime(
+                settings,
+                project,
+                "test-model:latest",
+                run_dir,
+                risk={"classification": "low"},
+            )
+            agent = (
+                run_dir
+                / "opencode-runtime/config/opencode/agents/local-mvp-coder.md"
+            ).read_text(encoding="utf-8")
+        self.assertIn("external_directory: allow", agent)
+        self.assertNotIn("external_directory: deny", agent)
+        # 源代码中含有解释性注释，说明为何 external_directory 必须为 allow
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        self.assertIn(".git", source)
+        self.assertIn("external_directory: allow", source)
+        self.assertIn("Seatbelt", source)
+
     @unittest.skipUnless(shutil.which("opencode"), "requires local OpenCode")
     def test_generated_opencode_agent_can_edit_a_scoped_candidate_file(self):
         """Exercise the installed OpenCode permission parser, not YAML alone."""
@@ -5250,7 +5334,9 @@ class OrchestratorTests(unittest.TestCase):
             resolved = project.resolve()
             result = subprocess.run(
                 [
-                    "opencode",
+                    # clean_child_environment 的 PATH 不含 opencode
+                    # 安装目录(如 ~/.opencode/bin),必须用绝对路径调用。
+                    shutil.which("opencode"),
                     "debug",
                     "agent",
                     settings.opencode_agent,
@@ -5509,7 +5595,7 @@ class OrchestratorTests(unittest.TestCase):
                 runtime,
                 run_dir,
                 Path("/bin/echo"),
-                "http://127.0.0.1:11434",
+                "localhost:11434",
             ).read_text(encoding="utf-8")
 
             self.assertIn("(deny default)", profile)
@@ -6071,6 +6157,397 @@ class OrchestratorTests(unittest.TestCase):
                 summary["workflow"]["implementation_workspace"]["promoted"]
             )
             self.assertEqual(summary["workflow"]["local_session_id"], "ses_e2e")
+
+    # ------------------------------------------------------------------
+    # DeepSeek provider
+    # ------------------------------------------------------------------
+
+    def test_deepseek_base_url_rejects_http(self):
+        with self.assertRaises(MODULE.WorkflowError):
+            MODULE._validate_deepseek_base_url("http://api.deepseek.com")
+
+    def test_deepseek_base_url_rejects_wrong_host(self):
+        with self.assertRaises(MODULE.WorkflowError):
+            MODULE._validate_deepseek_base_url("https://api.not-deepseek.com")
+
+    def test_deepseek_base_url_rejects_userinfo(self):
+        with self.assertRaises(MODULE.WorkflowError):
+            MODULE._validate_deepseek_base_url("https://user:pass@api.deepseek.com")
+
+    def test_deepseek_base_url_accepts_default(self):
+        self.assertEqual(
+            MODULE._validate_deepseek_base_url("https://api.deepseek.com"),
+            443,
+        )
+
+    def test_deepseek_base_url_accepts_custom_port(self):
+        self.assertEqual(
+            MODULE._validate_deepseek_base_url("https://api.deepseek.com:8443"),
+            8443,
+        )
+
+    def test_deepseek_runtime_config_has_no_plaintext_key(self):
+        settings = replace(
+            MODULE.load_settings(), opencode_provider="deepseek"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            run_dir = root / "run"
+            project.mkdir()
+            run_dir.mkdir()
+            (project / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["true"]\n', encoding="utf-8"
+            )
+            (run_dir / "plan.md").write_text(
+                "# Plan\n\n- `src/app.py`\n", encoding="utf-8"
+            )
+            with mock.patch.dict(
+                os.environ, {"DEEPSEEK_API_KEY": "sk-1234testsecret5678"}
+            ):
+                config_path, _environment = MODULE.prepare_opencode_runtime(
+                    settings,
+                    project,
+                    "test-model:latest",
+                    run_dir,
+                    risk={"classification": "low"},
+                )
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(config["model"], "deepseek/deepseek-v4-pro")
+            self.assertEqual(set(config["provider"]), {"deepseek"})
+            ds_provider = config["provider"]["deepseek"]
+            self.assertEqual(ds_provider["npm"], "@ai-sdk/deepseek")
+            self.assertEqual(ds_provider["apiKey"], "{env:DEEPSEEK_API_KEY}")
+            # Ensure no plaintext key leaked into config
+            config_text = config_path.read_text(encoding="utf-8")
+            self.assertNotIn("sk-1234", config_text)
+            self.assertNotIn("testsecret", config_text)
+
+    def test_deepseek_missing_api_key_fails_preflight(self):
+        settings = replace(
+            MODULE.load_settings(), opencode_provider="deepseek"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            run_dir = root / "run"
+            project.mkdir()
+            run_dir.mkdir()
+            (project / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["true"]\n', encoding="utf-8"
+            )
+            (run_dir / "plan.md").write_text(
+                "# Plan\n\n- `src/app.py`\n", encoding="utf-8"
+            )
+            with mock.patch.dict(os.environ, {}, clear=False):
+                try:
+                    del os.environ["DEEPSEEK_API_KEY"]
+                except KeyError:
+                    pass
+                with self.assertRaises(MODULE.WorkflowError) as ctx:
+                    MODULE.prepare_opencode_runtime(
+                        settings,
+                        project,
+                        "test-model:latest",
+                        run_dir,
+                        risk={"classification": "low"},
+                    )
+            error_msg = str(ctx.exception)
+            self.assertIn("DEEPSEEK_API_KEY", error_msg)
+            self.assertNotIn("sk-", error_msg)
+
+    def test_deepseek_seatbelt_profile_has_deepseek_host_not_ollama(self):
+        settings = replace(
+            MODULE.load_settings(), opencode_provider="deepseek"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            runtime = root / "runtime"
+            run_dir = root / "run"
+            for path in (workspace, runtime, run_dir):
+                path.mkdir()
+            deepseek_host = MODULE.deepseek_seatbelt_remote(
+                settings.deepseek_base_url
+            )
+            profile = MODULE.write_opencode_profile(
+                workspace,
+                runtime,
+                run_dir,
+                Path("/bin/echo"),
+                deepseek_host,
+            ).read_text(encoding="utf-8")
+            self.assertIn(
+                f'(allow network-outbound (remote ip "*:443"))',
+                profile,
+            )
+            self.assertNotIn("localhost:11434", profile)
+            self.assertNotIn("(allow network*)", profile)
+            self.assertNotIn("api.deepseek.com", profile)
+
+    @unittest.skipIf(
+        os.environ.get("MVP_VALIDATION_SANDBOX") == "1",
+        "父级验证 Seatbelt 中不能可靠嵌套 sandbox-exec",
+    )
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS sandbox-exec")
+    def test_deepseek_seatbelt_profile_compiles_with_sandbox_exec(self):
+        settings = replace(
+            MODULE.load_settings(), opencode_provider="deepseek"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            runtime = root / "runtime"
+            run_dir = root / "run"
+            for path in (workspace, runtime, run_dir):
+                path.mkdir()
+            deepseek_host = MODULE.deepseek_seatbelt_remote(
+                settings.deepseek_base_url
+            )
+            profile = MODULE.write_opencode_profile(
+                workspace,
+                runtime,
+                run_dir,
+                Path("/usr/bin/true"),
+                deepseek_host,
+            )
+            result = subprocess.run(
+                ["sandbox-exec", "-f", str(profile), "/bin/true"],
+                cwd=workspace,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 71:
+                self.skipTest("父级 Seatbelt 不允许嵌套 sandbox-exec")
+            self.assertNotIn("unsupported syntax", result.stderr)
+            self.assertNotIn("compile", result.stderr.lower())
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_deepseek_capability_probe_reports_api_key_status(self):
+        settings = replace(
+            MODULE.load_settings(),
+            opencode_provider="deepseek",
+            opencode_command="opencode-test",
+        )
+        completed = subprocess.CompletedProcess(
+            ["opencode-test", "run", "--help"],
+            0,
+            stdout="--model --agent --format --session --dir --pure\n",
+            stderr=None,
+        )
+        with (
+            mock.patch.object(MODULE.shutil, "which", return_value="/bin/opencode"),
+            mock.patch.object(MODULE.subprocess, "run", return_value=completed),
+            mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-test"}),
+        ):
+            probe = MODULE.opencode_capability_probe(settings)
+        self.assertEqual(probe["status"], "passed")
+        self.assertEqual(probe["provider"], "deepseek")
+        self.assertTrue(probe["api_key_configured"])
+
+    def test_deepseek_capability_probe_reports_missing_key(self):
+        settings = replace(
+            MODULE.load_settings(),
+            opencode_provider="deepseek",
+            opencode_command="opencode-test",
+        )
+        completed = subprocess.CompletedProcess(
+            ["opencode-test", "run", "--help"],
+            0,
+            stdout="--model --agent --format --session --dir --pure\n",
+            stderr=None,
+        )
+        with (
+            mock.patch.object(MODULE.shutil, "which", return_value="/bin/opencode"),
+            mock.patch.object(MODULE.subprocess, "run", return_value=completed),
+            mock.patch.dict(os.environ, {}, clear=False),
+        ):
+            try:
+                del os.environ["DEEPSEEK_API_KEY"]
+            except KeyError:
+                pass
+            probe = MODULE.opencode_capability_probe(settings)
+        self.assertEqual(probe["provider"], "deepseek")
+        self.assertFalse(probe["api_key_configured"])
+        self.assertEqual(probe["status"], "passed")
+        self.assertEqual(probe["missing_flags"], [])
+
+    def test_opencode_provider_validation_rejects_unknown_values(self):
+        settings = replace(
+            MODULE.load_settings(), opencode_provider="unknown-provider"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            plan = root / "plan.md"
+            project.mkdir()
+            plan.write_text("Risk classification: low\n", encoding="utf-8")
+            with (
+                mock.patch.object(MODULE, "load_settings", return_value=settings),
+                self.assertRaises(MODULE.WorkflowError) as ctx,
+            ):
+                MODULE._command_run_locked(
+                    SimpleNamespace(
+                        project=str(project), plan=str(plan), model="primary",
+                        local_backend="opencode", allow_dirty=False, live=False,
+                    )
+                )
+        self.assertIn("opencode_provider", str(ctx.exception))
+        self.assertIn("ollama", str(ctx.exception))
+        self.assertIn("deepseek", str(ctx.exception))
+
+    def test_call_opencode_coder_deepseek_passes_api_key_to_env(self):
+        settings = replace(
+            MODULE.load_settings(), opencode_provider="deepseek"
+        )
+        output = json.dumps(
+            {
+                "type": "text",
+                "sessionID": "ses_ds",
+                "part": {"text": "已完成"},
+            }
+        )
+        completed = subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            run_dir = root / "run"
+            project.mkdir()
+            run_dir.mkdir()
+            (root / "runtime/tmp").mkdir(parents=True)
+
+            with (
+                mock.patch.object(MODULE, "ensure_opencode_available"),
+                mock.patch.object(
+                    MODULE,
+                    "prepare_opencode_runtime",
+                    return_value=(
+                        root / "runtime/config/opencode/opencode.json",
+                        {"HOME": str(root)},
+                    ),
+                ),
+                mock.patch.object(
+                    MODULE.shutil, "which", return_value="/bin/echo"
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "write_opencode_profile",
+                    return_value=root / "opencode.sb",
+                ),
+                mock.patch.object(
+                    MODULE, "run_command"
+                ) as run_command,
+                mock.patch.dict(
+                    os.environ, {"DEEPSEEK_API_KEY": "sk-deepseek-mock-key"}
+                ),
+            ):
+                run_command.return_value = completed
+                MODULE.call_opencode_coder(
+                    settings,
+                    project,
+                    "test-model:latest",
+                    "prompt",
+                    run_dir,
+                    "coder-initial",
+                    risk={"classification": "low"},
+                )
+            env = run_command.call_args.kwargs["extra_env"]
+            self.assertEqual(env["DEEPSEEK_API_KEY"], "sk-deepseek-mock-key")
+
+    def test_deepseek_runtime_copies_host_models_cache(self):
+        settings = replace(
+            MODULE.load_settings(), opencode_provider="deepseek"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            run_dir = root / "run"
+            project.mkdir()
+            run_dir.mkdir()
+            (project / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["true"]\n', encoding="utf-8"
+            )
+            (run_dir / "plan.md").write_text(
+                "# Plan\n\n- `src/app.py`\n", encoding="utf-8"
+            )
+            host_models = root / "host-cache/.cache/opencode/models.json"
+            host_models.parent.mkdir(parents=True)
+            host_models.write_text('{"models":[]}', encoding="utf-8")
+            with (
+                mock.patch.object(
+                    MODULE, "load_settings", return_value=settings
+                ),
+                mock.patch.dict(
+                    os.environ, {"DEEPSEEK_API_KEY": "sk-test-cache"}
+                ),
+                mock.patch.object(
+                    MODULE.Path, "home", return_value=root / "host-cache"
+                ),
+            ):
+                config_path, environment = MODULE.prepare_opencode_runtime(
+                    settings,
+                    project,
+                    "test-model:latest",
+                    run_dir,
+                    risk={"classification": "low"},
+                )
+            isolated = (
+                Path(environment["XDG_CACHE_HOME"])
+                / "opencode"
+                / "models.json"
+            )
+            self.assertTrue(isolated.is_file())
+            self.assertEqual(
+                isolated.read_text(encoding="utf-8"), '{"models":[]}'
+            )
+
+    def test_deepseek_runtime_fails_when_host_models_cache_missing(self):
+        settings = replace(
+            MODULE.load_settings(), opencode_provider="deepseek"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            run_dir = root / "run"
+            project.mkdir()
+            run_dir.mkdir()
+            (project / ".mvp-ai.toml").write_text(
+                '[validation]\ncommands = ["true"]\n', encoding="utf-8"
+            )
+            (run_dir / "plan.md").write_text(
+                "# Plan\n\n- `src/app.py`\n", encoding="utf-8"
+            )
+            with (
+                mock.patch.object(
+                    MODULE, "load_settings", return_value=settings
+                ),
+                mock.patch.dict(
+                    os.environ, {"DEEPSEEK_API_KEY": "sk-test-cache"}
+                ),
+                mock.patch.object(
+                    MODULE.Path, "home",
+                    return_value=root / "host-cache",
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError, "models.dev"
+                ):
+                    MODULE.prepare_opencode_runtime(
+                        settings,
+                        project,
+                        "test-model:latest",
+                        run_dir,
+                        risk={"classification": "low"},
+                    )
+
+    def test_default_ollama_settings_unchanged(self):
+        settings = MODULE.load_settings()
+        self.assertEqual(settings.opencode_provider, "ollama")
+        self.assertTrue(MODULE.is_loopback_ollama_endpoint(settings.ollama_host))
+        defaults = MODULE.load_toml(MODULE.DEFAULTS_PATH)
+        self.assertEqual(defaults["local"].get("opencode_provider"), "ollama")
 
 
 if __name__ == "__main__":
